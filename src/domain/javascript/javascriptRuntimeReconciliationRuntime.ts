@@ -2,11 +2,13 @@ import type { JsonValue } from "../jsonValue.js";
 import {
   createJavaScriptApplicationEdge,
   createJavaScriptApplicationNode,
-  type ApplicationEdge,
-  type ApplicationGraphEvidence,
-  type ApplicationNode,
 } from "./javascriptApplicationGraph.js";
-import type { ParsedRuntimeCapture } from "./javascriptRuntimeReconciliationParsing.js";
+import type {
+  ApplicationEdge,
+  ApplicationNode,
+} from "./javascriptApplicationGraphSchemas.js";
+import type { ApplicationGraphEvidence } from "./javascriptApplicationEvidenceSchemas.js";
+import type { ParsedRuntimeCapture } from "./javascriptRuntimeReconciliationCaptureParsing.js";
 
 export interface RuntimeReconciliationEntity {
   readonly kind: "target" | "frame" | "script" | "worker";
@@ -142,15 +144,23 @@ const scriptEntities = (
 ): RuntimeReconciliationEntity[] =>
   capture.inspection.scripts.items.map((script) => {
     const location =
-      "url" in script
-        ? ({ kind: "url", value: script.url } as const)
-        : ({ kind: "file", value: script.file_path } as const);
+      "unresolved_location" in script
+        ? ({
+            kind: "unresolved",
+            value: script.unresolved_location.reported_url,
+          } as const)
+        : "url" in script
+          ? ({ kind: "url", value: script.url } as const)
+          : ({ kind: "file", value: script.file_path } as const);
     return runtimeEntity(capture, {
       kind: "script",
       nodeKind: "runtime-script-instance",
       runtimeKey: script.script_key,
       targetKey: capture.inspection.target.target_id,
-      frameKey: script.frame_id,
+      frameKey:
+        "frame_scope" in script && script.frame_scope === "unknown"
+          ? null
+          : script.frame_id,
       scriptKey: script.script_key,
       location,
       staticKind: "javascript",
@@ -159,7 +169,28 @@ const scriptEntities = (
         : null,
       label: location.value,
       properties: {
-        location: location.value,
+        ...("unresolved_location" in script
+          ? {
+              location_kind: "unresolved",
+              reported_url: script.unresolved_location.reported_url,
+              location_reason: script.unresolved_location.reason,
+            }
+          : { location: location.value }),
+        ...("reported_url" in script && script.reported_url !== undefined
+          ? { reported_url: script.reported_url }
+          : {}),
+        ...("frame_scope" in script && script.frame_scope !== undefined
+          ? {
+              frame_scope: script.frame_scope,
+              reported_frame_id: script.frame_id,
+            }
+          : {}),
+        ...("has_source_url" in script && script.has_source_url !== undefined
+          ? { has_source_url: script.has_source_url }
+          : {}),
+        ...("frame_claims" in script && script.frame_claims !== undefined
+          ? { frame_claims: script.frame_claims }
+          : {}),
         cdp_hash: script.cdp_hash,
         length: script.length,
         is_module: script.is_module,

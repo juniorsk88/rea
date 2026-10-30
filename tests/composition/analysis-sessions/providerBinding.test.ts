@@ -1,7 +1,7 @@
-import { writeFile } from "node:fs/promises";
+import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 import { z } from "zod";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
@@ -21,6 +21,7 @@ import { composeBinarySession } from "../../../src/application/binary/BinarySess
 import { SessionProviderRouter } from "../../../src/application/binary/SessionProviderRouter.js";
 import { createAnalysisProfile } from "../../../src/domain/analysisProfile.js";
 import { AnalysisCancelledError } from "../../../src/domain/analysisErrorCore.js";
+import { thinMach } from "../../../src/domain/binaryTarget.fixture.js";
 import { ProviderAdapterError } from "../../../src/domain/providerAdapterError.js";
 import { err, ok } from "../../../src/domain/result.js";
 
@@ -61,7 +62,7 @@ describe("target-bound provider routing", () => {
     expect(session.activeTarget()).toBeUndefined();
 
     expect((await session.open(target, { providerId: "alpha" })).ok).toBe(true);
-    expect(bindingStatus(session)).toMatchObject({
+    expect(await bindingStatus(session)).toMatchObject({
       analysis_provider_binding: {
         provider: { id: "alpha", version: "1" },
         selection_source: "request",
@@ -100,7 +101,7 @@ describe("target-bound provider routing", () => {
 
     alpha.available = false;
     expect((await session.open(target)).ok).toBe(true);
-    expect(bindingStatus(session)).toMatchObject({
+    expect(await bindingStatus(session)).toMatchObject({
       analysis_provider_binding: { provider: { id: "alpha" } },
     });
 
@@ -108,7 +109,7 @@ describe("target-bound provider routing", () => {
     expect(unknown.ok).toBe(false);
     if (!unknown.ok)
       expect(unknown.error).toMatchObject({ reason: "unknown_provider" });
-    expect(bindingStatus(session)).toMatchObject({
+    expect(await bindingStatus(session)).toMatchObject({
       analysis_provider_binding: { provider: { id: "alpha" } },
     });
 
@@ -119,7 +120,7 @@ describe("target-bound provider routing", () => {
     expect(failed.ok).toBe(false);
     if (!failed.ok) expect(failed.error._tag).toBe("ProviderAdapterError");
     expect(alpha.clients[0]?.calls).toEqual(["address_name"]);
-    expect(bindingStatus(session)).toMatchObject({
+    expect(await bindingStatus(session)).toMatchObject({
       analysis_provider_binding: { provider: { id: "beta" } },
     });
 
@@ -127,29 +128,7 @@ describe("target-bound provider routing", () => {
     expect(beta.clients[0]?.closed).toBe(true);
   });
 
-  it("preserves bundle-root identity for artifact inventory operations", async () => {
-    const target = await databaseTarget();
-    const analysis = deepProvider("alpha");
-    const artifact = auxiliaryProvider("artifact", "inventory_artifact");
-    const session = selectableSession([analysis.provider], artifact);
-
-    expect((await session.open(target, { providerId: "alpha" })).ok).toBe(true);
-    const result = await session.execute("inventory_artifact", {});
-    if (!result.ok) throw result.error;
-
-    expect(result).toMatchObject({
-      ok: true,
-      value: {
-        subject: {
-          path: target,
-          sha256: "f".repeat(64),
-          format: "directory",
-        },
-      },
-    });
-  });
-
-  it("cancels a provider switch, closes its old client, and restores the binding", async () => {
+  it("preserves the active client when a provider switch is cancelled while draining", async () => {
     const target = await databaseTarget();
     const alpha = deepProvider("alpha");
     const beta = deepProvider("beta");
@@ -176,18 +155,89 @@ describe("target-bound provider routing", () => {
       ok: false,
       error: new AnalysisCancelledError("open_binary"),
     });
-    expect(alpha.clients[0]?.closed).toBe(true);
+    expect(alpha.clients[0]?.closed).toBe(false);
     expect(beta.clients).toHaveLength(0);
-    expect(bindingStatus(session)).toMatchObject({
+    expect(await bindingStatus(session)).toMatchObject({
       analysis_provider_binding: { provider: { id: "alpha" } },
     });
 
     alpha.pending = undefined;
-    const restored = await session.execute("address_name", { address: "0x2" });
-    expect(restored.ok && restored.value.provider.id).toBe("alpha");
-    expect(alpha.clients).toHaveLength(2);
+    const retained = await session.execute("address_name", { address: "0x2" });
+    expect(retained.ok && retained.value.provider.id).toBe("alpha");
+    expect(alpha.clients).toHaveLength(1);
     await session.close();
-    expect(alpha.clients[1]?.closed).toBe(true);
+    expect(alpha.clients[0]?.closed).toBe(true);
+  });
+});
+
+it("preserves bundle-root identity for artifact inventory operations", async () => {
+  const directory = await createTestTempDirectory("rea-provider-bundle-");
+  const target = join(directory, "Fixture.app");
+  const executable = join(target, "Fixture");
+  const infoPlist = join(target, "Info.plist");
+  await mkdir(target);
+  await writeFile(
+    infoPlist,
+    "<plist><dict><key>CFBundleExecutable</key><string>Fixture</string></dict></plist>",
+  );
+  await writeFile(executable, thinMach(0xfeedfacf, 0x0100000c));
+  const analysis = deepProvider("alpha");
+  const artifact = auxiliaryProvider("artifact", "inventory_artifact");
+  const session = selectableSession([analysis.provider], artifact);
+  onTestFinished(async () => {
+    await session.close();
+  });
+
+  expect((await session.open(target, { providerId: "alpha" })).ok).toBe(true);
+  expect(session.activeTarget()).toMatchObject({
+    path: await realpath(executable),
+    sourcePath: await realpath(target),
+    bundleInfoPlist: await realpath(infoPlist),
+  });
+  const result = await session.execute("inventory_artifact", {});
+  if (!result.ok) throw result.error;
+
+  expect(result).toMatchObject({
+    ok: true,
+    value: {
+      subject: {
+        path: target,
+        sha256: "f".repeat(64),
+        format: "directory",
+      },
+    },
+  });
+});
+
+describe("selected provider capability provenance", () => {
+  it("labels selected-provider capabilities with the resolved identity", async () => {
+    const target = await databaseTarget();
+    const alpha = deepProvider("alpha");
+    const session = selectableSession([alpha.provider], auxiliaryProvider());
+
+    expect((await session.open(target, { providerId: "alpha" })).ok).toBe(true);
+    const resolved = { id: "alpha", name: "alpha provider", version: "1" };
+    const status = await bindingStatus(session);
+    expect(status).toMatchObject({
+      analysis_provider_binding: { provider: resolved },
+      analysis_provider_candidates: [
+        {
+          provider: resolved,
+          selected: true,
+          capabilities: [{ provider: resolved }],
+        },
+      ],
+    });
+    expect(
+      z
+        .object({ capabilities: z.array(z.object({ provider: z.unknown() })) })
+        .parse(status)
+        .capabilities.map(({ provider }) => provider),
+    ).toEqual([
+      { id: "alpha", name: "alpha provider", version: "1" },
+      { id: "auxiliary", name: "auxiliary provider", version: "1" },
+    ]);
+    await session.close();
   });
 });
 
@@ -249,7 +299,6 @@ const deepProvider = (id: string): DeepProviderFixture => {
             { id, name: identity.name, version: "1" },
             { provider: id },
           ),
-          compatibility: {},
         }),
       );
     },
@@ -258,6 +307,8 @@ const deepProvider = (id: string): DeepProviderFixture => {
       fixture.clients.push(state);
       return {
         execute: (operation) => {
+          if (operation === "health")
+            return Promise.resolve(successfulExecution(id, profile?.provider));
           state.calls.push(operation);
           if (fixture.fail)
             return Promise.resolve(
@@ -268,7 +319,7 @@ const deepProvider = (id: string): DeepProviderFixture => {
         },
         close: () => {
           state.closed = true;
-          return Promise.resolve();
+          return Promise.resolve(ok(null));
         },
       };
     },
@@ -317,7 +368,7 @@ const auxiliaryProvider = (
             ),
           ),
         ),
-      close: () => Promise.resolve(),
+      close: () => Promise.resolve(ok(null)),
     }),
   };
 };
@@ -358,14 +409,14 @@ const databaseTarget = async (): Promise<string> => {
   return path;
 };
 
-const bindingStatus = (session: BinarySession) =>
+const bindingStatus = async (session: BinarySession) =>
   z
     .object({
       analysis_provider_binding: z.unknown(),
       analysis_provider_candidates: z.array(z.unknown()),
     })
     .passthrough()
-    .parse(session.status());
+    .parse(await session.status());
 
 interface Deferred<Value> {
   readonly promise: Promise<Value>;

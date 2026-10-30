@@ -1,9 +1,12 @@
 import type { AnalysisProfileCommitment } from "../../domain/analysisProfile.js";
-import type { BinaryTarget } from "../../domain/binaryTarget.js";
+import {
+  artifactTargetSelectedPath,
+  type BinaryTarget,
+} from "../../domain/binaryTargetTypes.js";
 import { AnalysisCapabilityUnavailableError } from "../../domain/analysisErrorCore.js";
 import { NoBinaryOpenError } from "../../domain/configurationErrors.js";
 import { ProviderAdapterError } from "../../domain/providerAdapterError.js";
-import { type AnalysisError } from "../../domain/analysisErrorBase.js";
+import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import type { JsonValue } from "../../domain/jsonValue.js";
 import type { EvidenceSubjectTarget } from "../../domain/evidence.js";
 import { err, ok, type Result } from "../../domain/result.js";
@@ -13,7 +16,10 @@ import type {
   AnalysisOperation,
   CapabilityDescriptor,
 } from "../AnalysisProvider.js";
-import { isSnapshotCacheable } from "./AnalysisSnapshotCache.js";
+import {
+  isSnapshotCacheable,
+  requiresNativeSourceAdmissionBeforeReplay,
+} from "./AnalysisSnapshotCache.js";
 import type { SessionProviderRoute } from "./SessionProviderRouter.js";
 
 interface ActiveExecutionBinding {
@@ -25,7 +31,7 @@ interface ActiveExecutionBinding {
 
 export interface PreparedSessionExecution {
   readonly active: ActiveExecutionBinding;
-  readonly capability: CapabilityDescriptor | undefined;
+  readonly capability: CapabilityDescriptor;
   readonly profile: AnalysisProfileCommitment | undefined;
   readonly cacheable: boolean;
   readonly cached: AnalysisExecution | undefined;
@@ -35,6 +41,7 @@ interface PrepareSessionExecutionInput {
   readonly active: ActiveExecutionBinding | undefined;
   readonly operation: AnalysisOperation;
   readonly parameters: Readonly<Record<string, JsonValue>>;
+  readonly nativeSourceAdmitted: boolean;
   readonly unboundOperationError: (
     operation: AnalysisOperation,
     route: SessionProviderRoute,
@@ -55,15 +62,13 @@ export const prepareSessionExecution = (
     active,
     operation,
     parameters,
+    nativeSourceAdmitted,
     unboundOperationError,
     lookupSnapshot,
   } = input;
   if (active === undefined) return err(new NoBinaryOpenError());
-  const capability = active.route.capabilities?.get(operation);
-  if (
-    active.route.capabilities !== undefined &&
-    capability?.available !== true
-  ) {
+  const capability = active.route.capabilities.get(operation);
+  if (capability?.available !== true) {
     const selectionError = unboundOperationError(operation, active.route);
     if (selectionError !== undefined) return err(selectionError);
     return err(
@@ -76,16 +81,18 @@ export const prepareSessionExecution = (
   }
   const profile =
     active.profile !== null &&
-    (capability === undefined ||
-      capability.provider.id === active.profile.provider.id)
+    capability.provider.id === active.profile.provider.id
       ? active.profile
       : undefined;
   const cacheable =
     profile !== undefined &&
     isSnapshotCacheable(operation, capability, parameters);
-  const cached = cacheable
-    ? lookupSnapshot(active.target, profile, operation, parameters)
-    : undefined;
+  const cached =
+    cacheable &&
+    (!requiresNativeSourceAdmissionBeforeReplay(capability.provider.id) ||
+      nativeSourceAdmitted)
+      ? lookupSnapshot(active.target, profile, operation, parameters)
+      : undefined;
   return ok({ active, capability, profile, cacheable, cached });
 };
 
@@ -130,6 +137,7 @@ export const bindExecutionTarget = (
       : { architecture: target.architecture }),
   };
   if (
+    result.value.subject !== undefined &&
     result.value.subject !== null &&
     result.value.subject.sha256 !== target.sha256 &&
     !isArtifactBundleSubject(operation, result.value.subject, target)
@@ -140,7 +148,9 @@ export const bindExecutionTarget = (
         `${operation}:subject`,
       ),
     );
-  return ok({ ...result.value, subject: result.value.subject ?? subject });
+  return result.value.subject === undefined
+    ? ok({ ...result.value, subject })
+    : result;
 };
 
 const isArtifactBundleSubject = (
@@ -148,7 +158,8 @@ const isArtifactBundleSubject = (
   subject: EvidenceSubjectTarget,
   target: BinaryTarget,
 ): boolean =>
+  target.bundleInfoPlist !== undefined &&
   (operation === "inventory_artifact" ||
     operation === "inspect_artifact" ||
     operation === "extract_artifact") &&
-  subject.path === (target.sourcePath ?? target.path);
+  subject.path === artifactTargetSelectedPath(target);

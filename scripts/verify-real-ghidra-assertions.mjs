@@ -3,7 +3,7 @@ import { hasTypedSwitchEvidence } from "./verify-real-ghidra-switch-assertions.m
 import { access } from "node:fs/promises";
 
 import { parseBinaryTarget } from "../dist/application/BinaryTargetResolver.js";
-import { SUPPORTED_GHIDRA_VERSION } from "../dist/ghidra/GhidraInstallation.js";
+import { SUPPORTED_GHIDRA_VERSION } from "../dist/ghidra/GhidraReleasePolicy.js";
 import { GHIDRA_SESSION_CAPABILITIES } from "../dist/ghidra/GhidraSessionValues.js";
 
 export function assertLocalProcedureInfo(info, expectedAddress) {
@@ -245,17 +245,13 @@ export function dossierSummary(dossier) {
   };
 }
 
-export async function assertSession(
-  session,
-  expectedDigest,
-  expectedTargetSha256,
-) {
+export function assertSession(session, expectedDigest, expectedTargetSha256) {
   if (
     session.provider.id !== "ghidra" ||
     session.provider.version !== SUPPORTED_GHIDRA_VERSION ||
     session.profile_digest !== expectedDigest ||
     session.target.sha256 !== expectedTargetSha256 ||
-    session.read_only !== true ||
+    session.read_only !== false ||
     session.analysis_complete !== true ||
     session.analysis_timed_out !== false ||
     session.capabilities.length !== GHIDRA_SESSION_CAPABILITIES.length ||
@@ -279,7 +275,12 @@ export function assertRuntimeCoordinates(coordinates) {
 }
 
 export async function assertCleanup(coordinates) {
-  for (const name of ["runtime_root", "endpoint_path", "project_root"]) {
+  for (const name of [
+    "runtime_root",
+    "endpoint_path",
+    "project_root",
+    "socket_root",
+  ]) {
     const path = coordinates[name];
     if (typeof path === "string" && (await exists(path)))
       throw new Error(`Ghidra cleanup left ${name}: ${path}`);

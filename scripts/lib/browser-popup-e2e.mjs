@@ -1,3 +1,4 @@
+import { requireMcpOutput } from "./mcp-verifier-results.mjs";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { once } from "node:events";
@@ -8,7 +9,7 @@ import { chromium } from "playwright-core";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 
-import { PlaywrightBrowserScenarioProvider } from "../../dist/browser/PlaywrightBrowserScenarioProvider.js";
+import { createBrowserScenarioProvider } from "../../dist/composition/browserScenario.js";
 import { PlaywrightScenarioEvents } from "../../dist/browser/PlaywrightScenarioEvents.js";
 import { BrowserScenarioSecrets } from "../../dist/browser/BrowserScenarioSecrets.js";
 import { browserScenarioSchema } from "../../dist/domain/browserScenario.js";
@@ -53,9 +54,9 @@ const scenarioFor = (executable, origin, events) =>
   });
 
 const capture = async (scenario) => {
-  const result = await new PlaywrightBrowserScenarioProvider().captureScenario(
-    scenario,
-  );
+  const result = await createBrowserScenarioProvider(
+    process.env,
+  ).captureScenario(scenario);
   if (!result.ok) throw result.error;
   assert.ok(
     result.value.steps.every((step) => step.status === "completed"),
@@ -98,13 +99,13 @@ const verifySharedContext = async (executable, origin) => {
       scenarioFor(executable, origin, ["network"]),
       {},
     );
-    assert.ok(secrets);
+    if (!secrets.ok) throw secrets.error;
     const events = new PlaywrightScenarioEvents({
       page,
       context,
       ownsContext: false,
       enabled: new Set(["network"]),
-      secrets,
+      secrets: secrets.value,
     });
     await Promise.all([
       page.goto(origin),
@@ -163,14 +164,11 @@ const verifyTransports = async (executable, origin) => {
       { timeout: 60_000 },
     );
     assert.notEqual(captured.isError, true, JSON.stringify(captured));
-    const evidence = parseEvidence({
-      ...captured.structuredContent?.evidence,
-      normalized_result: captured.structuredContent?.result,
-    });
-    assertNetwork(
-      browserScenarioCaptureSchema.parse(evidence.normalized_result),
-      origin,
+    assert.notEqual(captured.structuredContent, undefined);
+    const evidence = parseEvidence(
+      requireMcpOutput(captured, "capture_browser_scenario"),
     );
+    assertNetwork(evidence.normalized_result, origin);
   } finally {
     try {
       await client.close();

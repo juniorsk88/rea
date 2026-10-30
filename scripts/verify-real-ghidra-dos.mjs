@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import {
+  requireMcpOperationResult,
+  requireMcpOutput,
+} from "./lib/mcp-verifier-results.mjs";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -17,13 +21,16 @@ import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { parseEvidence } from "../dist/domain/evidence.js";
-import {
-  functionBodySchema,
-  functionDossierSchema,
-} from "../dist/domain/hopperValues.js";
-import { inspectGhidraInstallation } from "../dist/ghidra/GhidraInstallation.js";
+import { functionDossierSchema } from "../dist/domain/native/functionDossier.js";
+import { functionBodySchema } from "../dist/domain/native/functionBody.js";
+import { inspectVerifierGhidraInstallation } from "./lib/ghidra-installation-inspection.mjs";
 import { buildDosMzFixture } from "../tests/conformance/ghidra/dos-mz-fixture.mjs";
-import { createVerifierRun, completeVerifierRun } from "./lib/verifier-run.mjs";
+import {
+  assertVerifierCleanupComplete,
+  createVerifierRun,
+  completeVerifierRun,
+} from "./lib/verifier-run.mjs";
+import { verifyGhidraAddressBoundaries } from "./lib/real-ghidra-address-boundaries.mjs";
 
 // This lane intentionally has no game paths, binary seeds or compiler dependency.
 if (process.argv.length !== 2)
@@ -36,7 +43,8 @@ if (process.env.GHIDRA_INSTALL_DIR === undefined)
   throw new Error(
     "verify:ghidra:dos prerequisite missing: GHIDRA_INSTALL_DIR (bring your own Ghidra).",
   );
-const installation = inspectGhidraInstallation({
+const installation = await inspectVerifierGhidraInstallation({
+  environment: process.env,
   installDir: process.env.GHIDRA_INSTALL_DIR,
   ...(process.env.JAVA_HOME === undefined
     ? {}
@@ -99,7 +107,7 @@ try {
   });
   const target = await call("open_binary", {
     path: targetPath,
-    provider: "ghidra",
+    provider_id: "ghidra",
   });
   opened = true;
   assert.equal(target.format, "dos-mz");
@@ -206,7 +214,10 @@ try {
     const resolved = await call("procedure_address", { procedure });
     assert.equal(resolved, procedure, "Flat address round-trip drifted");
     const info = await call("procedure_info", { procedure });
-    const dossierResult = await evidenceCall("analyze_function", { procedure });
+    const dossierResult = await evidenceCall("analyze_function", {
+      procedure,
+      detail: "complete",
+    });
     const dossier = functionDossierSchema.parse(
       dossierResult.normalized_result,
     );
@@ -367,6 +378,11 @@ try {
     arguments: { procedure: "0xffffffffffffffff" },
   });
   assert.equal(invalid.isError, true, "Unmapped address did not fail");
+  await verifyGhidraAddressBoundaries(
+    client,
+    identities.entry.address,
+    cliEvidence,
+  );
   const cliWindow = await cliEvidence("instructions", identities.entry.address);
   assert.deepEqual(
     cliWindow.normalized_result,
@@ -428,6 +444,7 @@ try {
       far_target: expected.far,
     },
     invalid_address_rejected: true,
+    address_truncation_rejected: true,
     original_unchanged: true,
     limitations: [
       "Read-only import/decompilation evidence, not DOS runtime execution or whole-program semantic equivalence.",
@@ -470,12 +487,7 @@ try {
 }
 assert.ok(report, "No DOS proof report was produced");
 const verifierRun = await completeVerifierRun(run);
-if (verifierRun.process_lineage.status === "verified")
-  assert.deepEqual(
-    verifierRun.process_lineage.descendants,
-    [],
-    "Owned descendants survived verifier cleanup",
-  );
+assertVerifierCleanupComplete(verifierRun.process_lineage);
 process.stdout.write(
   `${JSON.stringify({ verifier_run: verifierRun, ...report, cleanup: "complete" })}\n`,
 );
@@ -490,7 +502,7 @@ function hexBytes(bytes) {
 function assertProfile(profile) {
   assert.equal(
     profile.parameters.load_image_evidence,
-    "independent-mz-mapping-relocations-v1",
+    "independent-mz-mapping-relocations-v2",
   );
   assert.equal(
     profile.parameters.function_body_evidence,
@@ -544,27 +556,18 @@ async function call(name, arguments_ = {}) {
     { name, arguments: arguments_ },
     { timeout: 240000 },
   );
-  assert.notEqual(result.isError, true, JSON.stringify(result));
-  assert.ok(
-    result.structuredContent && "result" in result.structuredContent,
-    `${name} omitted structured result`,
-  );
-  return result.structuredContent.result;
+  assert.ok(result.structuredContent, `${name} omitted structured result`);
+  return requireMcpOperationResult(result, name);
 }
 async function evidenceCall(name, arguments_) {
   const result = await client.callTool(
     { name, arguments: arguments_ },
     { timeout: 240000 },
   );
-  assert.notEqual(result.isError, true, JSON.stringify(result));
-  const evidence = parseEvidence({
-    ...result.structuredContent?.evidence,
-    normalized_result: result.structuredContent?.result,
-  });
+  const evidence = parseEvidence(requireMcpOutput(result, name));
   assert.equal(evidence.subject.digest.sha256, sha256);
-  assert.equal(evidence.provider.id, "rea-workflow");
-  assert.equal(evidence.analysis_profile.provider.id, "rea-workflow");
-  assertProfile(evidence.analysis_profile.parameters.upstream_analysis_profile);
+  assert.equal(evidence.provider.id, "ghidra");
+  assertProfile(evidence.analysis_profile);
   return evidence;
 }
 async function cliEvidence(command, procedure, options = []) {

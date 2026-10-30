@@ -1,40 +1,35 @@
-import { canonicalDigest } from "../domain/comparisonSemantics.js";
+import { digestCanonicalValue } from "../domain/canonicalDigest.js";
 import type { ProviderIdentity } from "./AnalysisProvider.js";
 import type { BrowserScenario } from "../domain/browserScenario.js";
 import type { BrowserScenarioCapture } from "../domain/browserScenarioCapture.js";
-import { sanitizeBrowserUrl } from "../domain/browserObservation.js";
 import {
   createEvidence,
   type Evidence,
   type EvidenceObservation,
 } from "../domain/evidence.js";
-import { jsonValueSchema } from "../domain/jsonValue.js";
+import { jsonObjectSchema } from "../domain/jsonValue.js";
+
+/** A step as Evidence records it: a request step leaves out an empty `save`, so a scenario that saves nothing records and hashes as it did before saved values existed. */
+const recordedAction = (
+  action: BrowserScenario["actions"][number],
+): Record<string, unknown> => {
+  if (action.action !== "request" || action.save.length > 0) return action;
+  const { save, ...rest } = action;
+  return rest;
+};
 
 const browserScenarioParameters = (
   scenario: BrowserScenario,
-): EvidenceObservation["parameters"] => ({
-  scenario_sha256: canonicalDigest(scenario, "Browser scenario"),
-  browser_mode: scenario.browser.mode,
-  ...(scenario.browser.mode === "launch"
-    ? { browser_headless: scenario.browser.headless }
-    : {}),
-  start_url: sanitizeBrowserUrl(scenario.start_url.url),
-  environment: scenario.environment,
-  actions: scenario.actions.map(({ step_id, action }) => ({
-    step_id,
-    action,
-  })),
-  action_timeouts_ms: scenario.actions.map((item) =>
-    "timeout_ms" in item ? (item.timeout_ms ?? null) : null,
-  ),
-  secret_declarations: scenario.secrets.map(
-    ({ secret_id, environment_variable }) => ({
-      secret_id,
-      environment_variable,
-    }),
-  ),
-  capture: scenario.capture,
-});
+): EvidenceObservation["parameters"] => {
+  const recorded = {
+    ...scenario,
+    actions: scenario.actions.map(recordedAction),
+  };
+  return {
+    ...jsonObjectSchema.parse(recorded),
+    scenario_sha256: digestCanonicalValue(recorded, "Browser scenario"),
+  };
+};
 
 /** Create Evidence without retaining resolved scenario secret values. */
 export const createBrowserScenarioEvidence = (
@@ -46,7 +41,7 @@ export const createBrowserScenarioEvidence = (
     predicateType: "rea.browser-scenario-capture",
     operation: "capture_browser_scenario",
     parameters: browserScenarioParameters(scenario),
-    result: jsonValueSchema.parse(capture),
+    result: capture,
     confidence: "observed",
     authority: "controlled-replay",
     environment: {

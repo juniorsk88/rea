@@ -1,10 +1,8 @@
 import type { ServerContext } from "@modelcontextprotocol/server";
 import { setImmediate } from "node:timers/promises";
 
-import {
-  AnalysisCancelledError,
-  AnalysisInputError,
-} from "../domain/analysisErrorCore.js";
+import { AnalysisError } from "../domain/analysisErrorBase.js";
+import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { mcpProgressReporter, type McpProgressContext } from "./mcpProgress.js";
 
@@ -18,7 +16,7 @@ export const runDerivedOperation = async <Value>(
   context: DerivedOperationContext,
   operation: string,
   compute: () => Value,
-): Promise<Result<Value, AnalysisCancelledError | AnalysisInputError>> => {
+): Promise<Result<Value, AnalysisError>> => {
   const progress = mcpProgressReporter(context);
   await progress.report({
     phase: "prepare",
@@ -28,16 +26,18 @@ export const runDerivedOperation = async <Value>(
   });
   await setImmediate();
   if (context.mcpReq.signal.aborted)
-    return err(new AnalysisCancelledError(operation));
+    return err(
+      new AnalysisCancelledError(operation, {
+        cause: context.mcpReq.signal.reason,
+      }),
+    );
   let value: Value;
   try {
     value = compute();
   } catch (cause: unknown) {
-    return err(
-      cause instanceof AnalysisCancelledError
-        ? cause
-        : new AnalysisInputError(operation, { cause }),
-    );
+    // Typed causes already name the failed constraint; keep their issues.
+    if (cause instanceof AnalysisError) return err(cause);
+    throw cause;
   }
   await progress.report({
     phase: "compute",
@@ -47,7 +47,11 @@ export const runDerivedOperation = async <Value>(
   });
   await setImmediate();
   if (context.mcpReq.signal.aborted)
-    return err(new AnalysisCancelledError(operation));
+    return err(
+      new AnalysisCancelledError(operation, {
+        cause: context.mcpReq.signal.reason,
+      }),
+    );
   await progress.report({
     phase: "complete",
     completed: 2,
@@ -55,5 +59,11 @@ export const runDerivedOperation = async <Value>(
     message: `Completed ${operation}`,
     terminal: true,
   });
+  if (context.mcpReq.signal.aborted)
+    return err(
+      new AnalysisCancelledError(operation, {
+        cause: context.mcpReq.signal.reason,
+      }),
+    );
   return ok(value);
 };

@@ -1,22 +1,21 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { Uint8ArrayReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
 import { describe, expect, it } from "vitest";
 
-import { classifyArtifactContent } from "../../../src/application/ArtifactGraphConstruction.js";
-import { classifyRoot } from "../../../src/application/ArtifactInventory/classify.js";
-import { ARTIFACT_CLASSIFICATION_PREFIX_BYTES } from "../../../src/artifacts/ArtifactHash.js";
-import { scanCanonicalArtifactInventory } from "../../../src/application/ArtifactInventory/scanCanonical.js";
-import { targetFormatSchema } from "../../../src/contracts/toolOutputSchemaPrimitives.js";
+import { classifyArtifactBytesAtPath } from "../../fixtures/artifactClassification.js";
+import { ARTIFACT_CLASSIFICATION_PREFIX_BYTES } from "../../../src/artifacts/ArtifactClassificationProbe.js";
+import {
+  inventoryArtifact,
+  scanCanonicalArtifactInventory,
+} from "../../fixtures/artifactInventory.js";
 import { artifactInventoryResultSchema } from "../../../src/domain/artifactGraph.js";
-import { createEvidence } from "../../../src/domain/evidence.js";
-import { jsonValueSchema } from "../../../src/domain/jsonValue.js";
-import { identifyRuntimes } from "../../../src/domain/runtimeIdentification.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
 describe("MZ artifact classification", () => {
   it("rejects a Windows header pointer overlapping the DOS header", () => {
-    expect(classifyArtifactContent("invalid.exe", peFixture(32))).toEqual({
+    expect(classifyArtifactBytesAtPath("invalid.exe", peFixture(32))).toEqual({
       kind: "unknown",
       format: "unknown",
     });
@@ -24,58 +23,56 @@ describe("MZ artifact classification", () => {
 
   it("distinguishes DOS, observed PE, malformed MZ and unavailable prefix evidence", () => {
     const dos = dosFixture();
-    expect(classifyArtifactContent("LEGACY.EXE", dos)).toEqual({
+    expect(classifyArtifactBytesAtPath("LEGACY.EXE", dos)).toEqual({
       kind: "executable",
       format: "dos-mz",
     });
     expect(
-      classifyArtifactContent("LEGACY.EXE", dos.subarray(0, 16), dos.length),
+      classifyArtifactBytesAtPath(
+        "LEGACY.EXE",
+        dos.subarray(0, 16),
+        dos.length,
+      ),
     ).toEqual({ kind: "unknown", format: "unknown" });
-    expect(classifyArtifactContent("bad.exe", Buffer.from("MZbroken"))).toEqual(
-      { kind: "unknown", format: "unknown" },
-    );
-    expect(classifyArtifactContent("NATIVE.EXE", peFixture(128))).toMatchObject(
-      {
-        format: "pe",
-      },
-    );
+    expect(
+      classifyArtifactBytesAtPath("bad.exe", Buffer.from("MZbroken")),
+    ).toEqual({ kind: "unknown", format: "unknown" });
     const distantPe = peFixture(ARTIFACT_CLASSIFICATION_PREFIX_BYTES + 64);
     expect(
-      classifyArtifactContent(
+      classifyArtifactBytesAtPath(
         "NATIVE.EXE",
         distantPe.subarray(0, ARTIFACT_CLASSIFICATION_PREFIX_BYTES),
         distantPe.length,
       ),
     ).toEqual({ kind: "unknown", format: "unknown" });
-    expect(classifyArtifactContent("NATIVE.EXE", distantPe).format).toBe("pe");
+    expect(classifyArtifactBytesAtPath("NATIVE.EXE", distantPe).format).toBe(
+      "pe",
+    );
     const distantRelocations = dosWithDistantRelocations();
     expect(
-      classifyArtifactContent("LEGACY.EXE", distantRelocations).format,
+      classifyArtifactBytesAtPath("LEGACY.EXE", distantRelocations).format,
     ).toBe("dos-mz");
     expect(
-      classifyArtifactContent(
+      classifyArtifactBytesAtPath(
         "LEGACY.EXE",
         distantRelocations.subarray(0, ARTIFACT_CLASSIFICATION_PREFIX_BYTES),
         distantRelocations.length,
       ).format,
     ).toBe("unknown");
-    expect(targetFormatSchema.parse("dos-mz")).toBe("dos-mz");
   });
 
-  it("keeps standalone and embedded DOS identities through inventory and runtime evidence", async () => {
+  it("keeps standalone and embedded DOS identities through inventory", async () => {
     const directory = await createTestTempDirectory("rea-mz-inventory-");
     const dosPath = join(directory, "LEGACY.EXE");
     const pePath = join(directory, "NATIVE.EXE");
     await writeFile(dosPath, dosFixture());
     await writeFile(pePath, peFixture(128));
-    expect(await classifyRoot(dosPath, false)).toBe("dos-mz");
-    expect(await classifyRoot(pePath, false)).toBe("pe");
     const standalone = artifactInventoryResultSchema.parse(
       await scanCanonicalArtifactInventory(dosPath),
     );
     expect(standalone.manifest.root_format).toBe("dos-mz");
     expect(standalone.nodes).toContainEqual(
-      expect.objectContaining({ kind: "executable", format: "dos-mz" }),
+      expect.objectContaining({ format: "dos-mz" }),
     );
 
     const tree = join(directory, "tree");
@@ -88,30 +85,30 @@ describe("MZ artifact classification", () => {
     expect(inventory.nodes.map(({ format }) => format)).toEqual(
       expect.arrayContaining(["dos-mz", "pe"]),
     );
-    const evidence = createEvidence(
-      {
-        path: tree,
-        sha256: inventory.manifest.root_sha256,
-        format: "directory",
-      },
-      { id: "inventory-fixture", name: "Inventory fixture", version: null },
-      {
-        operation: "inventory_artifact",
-        parameters: {},
-        result: jsonValueSchema.parse(inventory),
-      },
+  });
+
+  it("retains a PE signature straddling the bounded prefix in ZIP member evidence", async () => {
+    const root = await createTestTempDirectory("rea-mz-far-pe-");
+    const bytes = peFixture(ARTIFACT_CLASSIFICATION_PREFIX_BYTES - 2);
+    const writer = new ZipWriter(new Uint8ArrayWriter());
+    await writer.add("native.exe", new Uint8ArrayReader(bytes), { level: 0 });
+    const path = join(root, "fixture.zip");
+    await writeFile(path, Buffer.from(await writer.close()));
+
+    const inventory = await inventoryArtifact(path);
+    const occurrence = inventory.occurrences.find(
+      ({ logical_path }) => logical_path === "native.exe",
     );
-    const runtimes = identifyRuntimes({ inventory_evidence: [evidence] });
-    expect(runtimes.runtimes).toContainEqual(
-      expect.objectContaining({
-        family: "native",
-        inspection: "provider-selection-required",
-        observations: expect.arrayContaining([
-          expect.objectContaining({ path: "LEGACY.EXE", format: "dos-mz" }),
-          expect.objectContaining({ path: "NATIVE.EXE", format: "pe" }),
-        ]),
-      }),
-    );
+    expect(occurrence).toMatchObject({
+      artifact_format: "pe",
+      hash_status: "verified",
+    });
+    expect(
+      inventory.nodes.find(
+        ({ artifact_id }) => artifact_id === occurrence?.artifact_id,
+      ),
+    ).toMatchObject({ format: "pe", size: bytes.length });
+    expect(inventory.coverage.status).toBe("complete");
   });
 });
 

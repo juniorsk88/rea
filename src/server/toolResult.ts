@@ -1,72 +1,43 @@
-import type { CallToolResult } from "@modelcontextprotocol/server";
+import { isNativeObservationOperation } from "../domain/native/nativeObservation.js";
+import { isNativeInventoryOperation } from "../domain/native/nativeInventory.js";
+import { STDIO_DEFAULT_MAX_BUFFER_SIZE } from "@modelcontextprotocol/server";
+import { ToolResultDelivery } from "./ToolResultDelivery.js";
+import { INSPECT_ANALYSIS_VIEW_OPERATION } from "../domain/analysisView/analysisViewErrors.js";
+import { inspectAnalysisViewInputSchema } from "../domain/analysisView/analysisView.js";
+import type { Evidence } from "../domain/evidence.js";
+import { jsonValueSchema, type JsonValue } from "../domain/jsonValue.js";
 
-import type { ToolContract } from "../contracts/toolContracts.js";
-import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
-import { type AnalysisError } from "../domain/analysisErrorBase.js";
-import type { JsonValue } from "../domain/jsonValue.js";
-import type { Result } from "../domain/result.js";
+/** Compose native Evidence continuation with the selected, parsed response budget. */
+export const createToolResultDelivery = (
+  maximumResponseBytes: number | undefined,
+): ToolResultDelivery =>
+  new ToolResultDelivery(
+    maximumResponseBytes ?? STDIO_DEFAULT_MAX_BUFFER_SIZE,
+    retainedEvidenceContinuation,
+  );
 
-/**
- * Serialize an application result as MCP text and structured content.
- * Shared error projection preserves actionable local diagnostics while omitting
- * raw causes and captured process output.
- */
-export const toCallToolResult = (
-  result: Result<JsonValue, AnalysisError>,
-  contract: ToolContract,
-): CallToolResult =>
-  result.ok ? successResult(result.value, contract) : errorResult(result.error);
-
-const errorResult = (error: AnalysisError): CallToolResult => {
-  const projected = projectAnalysisError(error);
-  const structuredContent = { error: projected };
+/** Offer a named, schema-validated source page only for retained native analysis. */
+const retainedEvidenceContinuation = (
+  evidence: Evidence,
+): Readonly<Record<string, JsonValue>> => {
+  const view =
+    evidence.operation === "analyze_function"
+      ? { kind: "native", facet: "pseudocode", offset: 0 }
+      : isNativeInventoryOperation(evidence.operation)
+        ? { kind: "native-inventory", offset: 0, limit: 64 }
+        : isNativeObservationOperation(evidence.operation)
+          ? { kind: "native-observation", offset: 0, limit: 64 }
+          : undefined;
+  if (view === undefined) return {};
+  const input = inspectAnalysisViewInputSchema.safeParse({
+    source: { kind: "retained-evidence", evidence_id: evidence.evidence_id },
+    view,
+  });
+  if (!input.success) return {};
   return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(structuredContent),
-      },
-    ],
-    structuredContent,
-    isError: true,
-  };
-};
-
-const successResult = (
-  value: JsonValue,
-  contract: ToolContract,
-): CallToolResult => {
-  const candidate =
-    projectEvidence(value) ??
-    (contract.kind === "session" ? { result: value } : value);
-  return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(candidate),
-      },
-    ],
-    structuredContent: candidate,
-  };
-};
-
-const projectEvidence = (value: JsonValue): JsonValue | undefined => {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    Array.isArray(value) ||
-    typeof value.evidence_id !== "string" ||
-    !/^ev_[a-f0-9]{64}$/u.test(value.evidence_id) ||
-    !("normalized_result" in value)
-  )
-    return undefined;
-  const normalizedResult = value.normalized_result;
-  const evidenceId = value.evidence_id;
-  if (normalizedResult === undefined || typeof evidenceId !== "string")
-    return undefined;
-  return {
-    result: normalizedResult,
-    evidence_id: evidenceId,
-    evidence: value,
+    continuation: {
+      name: INSPECT_ANALYSIS_VIEW_OPERATION,
+      arguments: jsonValueSchema.parse(input.data),
+    },
   };
 };

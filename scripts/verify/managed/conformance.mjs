@@ -7,12 +7,13 @@ import { inspectManagedArtifactBytes } from "../../../dist/dotnet/ManagedArtifac
 import { inspectManagedMembersBytes } from "../../../dist/dotnet/ManagedMemberInspector.js";
 import { inspectManagedNativeBoundariesBytes } from "../../../dist/dotnet/ManagedNativeBoundaryInspector.js";
 import { compareManagedMemberPaths } from "../../../dist/application/managed/ManagedMemberComparisonService.js";
-import { verifyManagedNativeBoundariesEvidence } from "../../../dist/application/managed/ManagedNativeVerificationService.js";
+import { executeManagedNativeBoundaries } from "../../../dist/application/managed/ManagedNativeVerificationService.js";
 import { importManagedReconstructionEvidence } from "../../../dist/application/managed/ManagedReconstructionService.js";
 import { projectManagedApplicationGraphEvidence } from "../../../dist/application/managed/ManagedApplicationGraphService.js";
 import { traceApplicationFeatureEvidence } from "../../../dist/application/javascript/JavaScriptApplicationWorkflowService.js";
-import { MANAGED_STATIC_PROVIDER } from "../../../dist/application/InvestigationProviders.js";
+import { MANAGED_STATIC_PROVIDER } from "../../../dist/domain/investigationProviders.js";
 import { createEvidence } from "../../../dist/domain/evidence.js";
+import { functionDossier } from "../../fixtures/managed/function-dossier.mjs";
 import {
   alternateMvid,
   buildNativePeFixture,
@@ -21,7 +22,6 @@ import { createManagedConformanceSupport } from "./support.mjs";
 import {
   comparisonLimits,
   defaultIlBody,
-  functionDossier,
   inspectionLimits,
   memberLimits,
   nativeBoundaryLimits,
@@ -34,6 +34,8 @@ import {
 
 const verifierRun = createVerifierRun();
 const workspace = await mkdtemp(join(tmpdir(), "rea-managed-conformance-"));
+let completionReportInput;
+let finalReport;
 const {
   fixture,
   fixtureBytes,
@@ -166,12 +168,15 @@ try {
       locations: [{ kind: "address", address: "0x401000" }],
     },
   );
-  const nativeVerification = verifyManagedNativeBoundariesEvidence({
+  const nativeVerification = executeManagedNativeBoundaries({
     managed_boundaries: frameworkBoundaryEvidence,
     native_observations: [nativeFunctionEvidence],
   });
   assert.equal(nativeVerification.ok, true);
-  assert.equal(nativeVerification.value.normalized_result.summary.verified, 1);
+  assert.equal(
+    nativeVerification.value.evidence.normalized_result.summary.verified,
+    1,
+  );
   const applicationGraph = projectManagedApplicationGraphEvidence({
     managed_artifact: frameworkArtifactEvidence,
     managed_members: frameworkMemberEvidence,
@@ -200,10 +205,7 @@ try {
     direction: "incoming",
   });
   assert.equal(applicationTrace.ok, true);
-  assert.equal(
-    applicationTrace.value.normalized_result.summary.matched_seeds,
-    1,
-  );
+  assert.equal(applicationTrace.value.result.summary.matched_seeds, 1);
 
   const readyToRun = await fixture("r2r-x64.exe", {
     machine: 0x8664,
@@ -378,65 +380,61 @@ try {
   const manifestSelfTest = await runManagedAppManifestSelfTest();
   const operatorManifest = await runOptionalManagedAppManifest();
   const ilspyOracle = await runOptionalIlspyOracle();
-  const completionReport = createManagedCompletionReport(
-    {
-      modern,
-      framework,
-      nativeFunctionTarget,
-      readyToRun,
-      obfuscated,
-      left,
-      right,
-      nativeOnly,
-      malformed,
-      manifestSelfTest,
-      operatorManifest,
-      ilspyOracle,
+  completionReportInput = {
+    modern,
+    framework,
+    nativeFunctionTarget,
+    readyToRun,
+    obfuscated,
+    left,
+    right,
+    nativeOnly,
+    malformed,
+    manifestSelfTest,
+    operatorManifest,
+    ilspyOracle,
+  };
+  finalReport = {
+    verified:
+      11 + (operatorManifest === null ? 0 : 1) + (ilspyOracle === null ? 0 : 1),
+    managedSurfaces: [
+      "inspect_managed_artifact",
+      "inspect_managed_members",
+      "inspect_managed_native_boundaries",
+      "compare_managed_members",
+      "verify_managed_native_boundaries",
+      "import_managed_reconstruction",
+      "project_managed_application_graph",
+    ],
+    coverage: [
+      "modern-dotnet-anycpu",
+      "dotnet-framework-x86-pinvoke",
+      "x64-ready-to-run-native-body",
+      "managed-native-verification",
+      "managed-application-graph-projection",
+      "unicode-obfuscated-identifiers",
+      "decompiler-reconstruction-import",
+      "mvid-and-token-drift",
+      "not-managed",
+      "malformed-metadata",
+      "operator-local-managed-manifest",
+      ...(ilspyOracle === null ? [] : ["ilspy-reconstruction-oracle"]),
+    ],
+    managedAppManifest: {
+      env: "REA_MANAGED_APP_MANIFEST_PATH",
+      selfTest: manifestSelfTest,
+      operator: operatorManifest ?? { configured: false },
     },
-    await completeVerifierRun(verifierRun),
-  );
-
-  process.stdout.write(
-    `${JSON.stringify({
-      verified:
-        11 +
-        (operatorManifest === null ? 0 : 1) +
-        (ilspyOracle === null ? 0 : 1),
-      managedSurfaces: [
-        "inspect_managed_artifact",
-        "inspect_managed_members",
-        "inspect_managed_native_boundaries",
-        "compare_managed_members",
-        "verify_managed_native_boundaries",
-        "import_managed_reconstruction",
-        "project_managed_application_graph",
-      ],
-      coverage: [
-        "modern-dotnet-anycpu",
-        "dotnet-framework-x86-pinvoke",
-        "x64-ready-to-run-native-body",
-        "managed-native-verification",
-        "managed-application-graph-projection",
-        "unicode-obfuscated-identifiers",
-        "decompiler-reconstruction-import",
-        "mvid-and-token-drift",
-        "not-managed",
-        "malformed-metadata",
-        "operator-local-managed-manifest",
-        ...(ilspyOracle === null ? [] : ["ilspy-reconstruction-oracle"]),
-      ],
-      managedAppManifest: {
-        env: "REA_MANAGED_APP_MANIFEST_PATH",
-        selfTest: manifestSelfTest,
-        operator: operatorManifest ?? { configured: false },
-      },
-      ilspyOracle: ilspyOracle ?? {
-        env: "REA_ILSPY_CMD_PATH",
-        configured: false,
-      },
-      completionReport,
-    })}\n`,
-  );
+    ilspyOracle: ilspyOracle ?? {
+      env: "REA_ILSPY_CMD_PATH",
+      configured: false,
+    },
+  };
 } finally {
   await rm(workspace, { recursive: true, force: true });
 }
+finalReport.completionReport = createManagedCompletionReport(
+  completionReportInput,
+  await completeVerifierRun(verifierRun),
+);
+process.stdout.write(`${JSON.stringify(finalReport)}\n`);

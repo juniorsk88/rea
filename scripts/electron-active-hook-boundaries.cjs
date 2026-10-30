@@ -61,7 +61,7 @@ const createElectronActiveBoundaryPatches = ({
         const target = typeof args[0] === "string" ? args[0] : null;
         recordRuntime("preload", "context-bridge-exposure", "attempted", {
           target,
-          argument_shapes: args.map((value) => shape(value)),
+          argument_shape_values: args,
           process_type: processType(),
         });
         try {
@@ -110,7 +110,7 @@ const createElectronActiveBoundaryPatches = ({
         event === "will-download" ? "blocked" : "observed",
         {
           target: identity(args[0], "webContents"),
-          argument_shapes: args.map((value) => shape(value)),
+          argument_shape_values: args,
           error: event === "will-download",
         },
       );
@@ -124,7 +124,7 @@ const createElectronActiveBoundaryPatches = ({
             (webContents, permission, callback) => {
               recordRuntime("permission", "permission-request", "blocked", {
                 target: identity(webContents, "webContents"),
-                argument_shapes: [shape(permission)],
+                argument_shape_values: [permission],
                 error: true,
               });
               if (typeof callback === "function") callback(false);
@@ -137,7 +137,7 @@ const createElectronActiveBoundaryPatches = ({
         return originalPermissionCheck.call(this, (webContents, permission) => {
           recordRuntime("permission", "permission-check", "blocked", {
             target: identity(webContents, "webContents"),
-            argument_shapes: [shape(permission)],
+            argument_shape_values: [permission],
             error: true,
           });
           return false;
@@ -148,7 +148,7 @@ const createElectronActiveBoundaryPatches = ({
       session.setCertificateVerifyProc = function blockedCertificate() {
         return originalCertificate.call(this, (request, callback) => {
           recordRuntime("permission", "certificate-error", "blocked", {
-            argument_shapes: [shape(request)],
+            argument_shape_values: [request],
             error: true,
           });
           if (typeof callback === "function") callback(-2);
@@ -168,14 +168,14 @@ const createElectronActiveBoundaryPatches = ({
         } catch {
           recordRuntime("popup-attempt", "window-open-handler", "failed", {
             target: contentsId,
-            argument_shapes: args.map((value) => shape(value)),
+            argument_shape_values: args,
             error: true,
           });
           return { action: "deny" };
         }
         recordRuntime("popup-attempt", "window-open-handler", "blocked", {
           target: contentsId,
-          argument_shapes: args.map((value) => shape(value)),
+          argument_shape_values: args,
           error: true,
         });
         return { action: "deny" };
@@ -195,9 +195,11 @@ const createElectronActiveBoundaryPatches = ({
     };
   };
 
-  const patchSessionManager = (sessionModule) => {
+  const patchSessionManager = (sessionModule, app) => {
     if (sessionModule === null || sessionModule === undefined) return;
-    patchSession(sessionModule.defaultSession);
+    if (app === undefined || app.isReady())
+      patchSession(sessionModule.defaultSession);
+    else app.once("ready", () => patchSession(sessionModule.defaultSession));
     for (const method of ["fromPartition", "fromPath"]) {
       const original = sessionModule[method];
       if (typeof original !== "function") continue;
@@ -212,6 +214,7 @@ const createElectronActiveBoundaryPatches = ({
   const patchApplicationEffects = (app) => {
     if (app === null || app === undefined) return;
     for (const method of [
+      "moveToApplicationsFolder",
       "relaunch",
       "setAsDefaultProtocolClient",
       "setLoginItemSettings",
@@ -220,12 +223,19 @@ const createElectronActiveBoundaryPatches = ({
       if (typeof original !== "function") continue;
       app[method] = function blockedApplicationEffect(...args) {
         recordRuntime(
-          method === "relaunch" ? "updater" : "protocol",
+          method === "relaunch"
+            ? "updater"
+            : method === "moveToApplicationsFolder"
+              ? "app-lifecycle"
+              : "protocol",
           method,
           "blocked",
-          { argument_shapes: args.map((value) => shape(value)), error: true },
+          { argument_shape_values: args, error: true },
         );
-        return method === "setAsDefaultProtocolClient" ? false : undefined;
+        return method === "setAsDefaultProtocolClient" ||
+          method === "moveToApplicationsFolder"
+          ? false
+          : undefined;
       };
     }
   };
@@ -250,11 +260,7 @@ const createElectronActiveBoundaryPatches = ({
       recordRuntime("native-addon", "dlopen", "attempted", {
         artifact_path: typeof filename === "string" ? filename : null,
         artifact_sha256: digest,
-        argument_shapes: [
-          shape(module),
-          shape(filename),
-          ...args.map((value) => shape(value)),
-        ],
+        argument_shape_value_groups: [[module, filename], args],
       });
       try {
         const result = original.call(this, module, filename, ...args);
@@ -280,7 +286,7 @@ const createElectronActiveBoundaryPatches = ({
     if (typeof original !== "function") return;
     utilityProcess.fork = function patchedFork(...args) {
       recordRuntime("process-lifecycle", "utility-process-fork", "attempted", {
-        argument_shapes: args.map((value) => shape(value)),
+        argument_shape_values: args,
         process_type: "main",
       });
       const child = original.apply(this, args);
@@ -304,7 +310,7 @@ const createElectronActiveBoundaryPatches = ({
         recordRuntime("process-lifecycle", `utility.${event}`, "observed", {
           target: childId,
           process_type: "utility",
-          argument_shapes: eventArgs.map((value) => shape(value)),
+          argument_shape_values: eventArgs,
         });
       });
       if (child && typeof child.postMessage === "function") {
@@ -337,17 +343,32 @@ const createElectronActiveBoundaryPatches = ({
     };
   };
 
+  // Each blocked method keeps the return contract of the Electron API it
+  // replaces, so a target that checks the result sees an ordinary refusal.
+  const blockedShellResults = {
+    openExternal: () =>
+      Promise.reject(new Error("External shell effects are blocked")),
+    openPath: () =>
+      Promise.reject(new Error("External shell effects are blocked")),
+    trashItem: () =>
+      Promise.reject(new Error("External shell effects are blocked")),
+    // Synchronous `void`: reveals a path in the host file manager.
+    showItemInFolder: () => undefined,
+    // Synchronous `boolean`: creates or replaces a Windows shortcut file.
+    writeShortcutLink: () => false,
+  };
+
   const patchShell = (shell) => {
     if (shell === null || shell === undefined) return;
-    for (const method of ["openExternal", "openPath"]) {
+    for (const [method, blockedResult] of Object.entries(blockedShellResults)) {
       const original = shell[method];
       if (typeof original !== "function") continue;
       shell[method] = function blockedShellCall(...args) {
         recordRuntime("shell-attempt", method, "blocked", {
-          argument_shapes: args.map((value) => shape(value)),
+          argument_shape_values: args,
           error: true,
         });
-        return Promise.reject(new Error("External shell effects are blocked"));
+        return blockedResult();
       };
     }
   };
@@ -359,7 +380,7 @@ const createElectronActiveBoundaryPatches = ({
       if (typeof original !== "function") continue;
       childProcess[method] = function patchedChildProcess(...args) {
         recordRuntime("process-lifecycle", `child.${method}`, "attempted", {
-          argument_shapes: args.map((value) => shape(value)),
+          argument_shape_values: args,
         });
         const child = original.apply(this, args);
         const childId = identity(child, "child");
@@ -369,7 +390,7 @@ const createElectronActiveBoundaryPatches = ({
         patchEmitter(child, (event, eventArgs) =>
           recordRuntime("process-lifecycle", `child.${event}`, "observed", {
             target: childId,
-            argument_shapes: eventArgs.map((value) => shape(value)),
+            argument_shape_values: eventArgs,
           }),
         );
         return child;

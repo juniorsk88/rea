@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import type { BinaryTarget } from "../../domain/binaryTarget.js";
-import { createEvidence } from "../../domain/evidence.js";
+import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
+import {
+  createEvidence,
+  withEvidenceCallerInputPath,
+} from "../../domain/evidence.js";
 import { createEvidenceBundle } from "../../domain/evidenceBundle.js";
 import { recordUnknownInputSchema } from "../../domain/residualUnknown.js";
+import { projectAnalysisError } from "../../domain/analysisErrorProjection.js";
 import { EvidenceLedger } from "./EvidenceLedger.js";
 
 const TARGET: BinaryTarget = {
@@ -15,6 +19,32 @@ const TARGET: BinaryTarget = {
   availableArchitectures: ["arm64"],
 };
 const PROVIDER = { id: "fixture", name: "Fixture provider", version: "1" };
+
+it("accepts and replaces caller path metadata for the same semantic record", () => {
+  const original = createEvidence(TARGET, PROVIDER, {
+    operation: "health",
+    parameters: {},
+    result: true,
+  });
+  const selected = withEvidenceCallerInputPath(original, "./selected-alias");
+  const ledger = new EvidenceLedger();
+  expect(ledger.record(original)).toEqual({ ok: true, value: "added" });
+  expect(ledger.record(selected)).toEqual({ ok: true, value: "duplicate" });
+  expect(ledger.import(createEvidenceBundle([selected]))).toEqual({
+    ok: true,
+    value: {
+      recordsAdded: 0,
+      unknownsAdded: 0,
+      changed: true,
+      replacements: [
+        { kind: "metadata", previous: original, current: selected },
+      ],
+    },
+  });
+  expect(ledger.get(original.evidence_id)?.caller_input_path).toBe(
+    "./selected-alias",
+  );
+});
 
 describe("evidence ledger recording", () => {
   it("deduplicates and atomically imports bundles", () => {
@@ -42,7 +72,7 @@ describe("evidence ledger recording", () => {
         recordsAdded: 0,
         unknownsAdded: 0,
         changed: false,
-        metadataChanged: false,
+        replacements: [],
       },
     });
     expect(ledger.export().records).toEqual([evidence]);
@@ -59,7 +89,13 @@ describe("evidence ledger recording", () => {
         recordsAdded: 0,
         unknownsAdded: 0,
         changed: true,
-        metadataChanged: true,
+        replacements: [
+          {
+            kind: "metadata",
+            previous: evidence,
+            current: relocatedBundleRecord,
+          },
+        ],
       },
     });
     expect(ledger.get(evidence.evidence_id)).toEqual(relocatedBundleRecord);
@@ -72,7 +108,7 @@ describe("evidence ledger recording", () => {
         recordsAdded: 0,
         unknownsAdded: 0,
         changed: false,
-        metadataChanged: false,
+        replacements: [],
       },
     });
     const conflictingBundle = createEvidenceBundle([
@@ -110,11 +146,41 @@ describe("evidence ledger recording", () => {
         recordsAdded: 0,
         unknownsAdded: 0,
         changed: false,
-        metadataChanged: false,
+        replacements: [],
       },
     });
     ledger.clear();
     expect(ledger.export().records).toEqual([]);
+  });
+
+  it("protects borrowed snapshots while preserving detached mutable public reads", () => {
+    const evidence = createEvidence(TARGET, PROVIDER, {
+      operation: "health",
+      parameters: {},
+      result: { nested: { value: "original" } },
+    });
+    const ledger = new EvidenceLedger();
+    expect(ledger.record(evidence).ok).toBe(true);
+    const borrowed = ledger.forAnalysis(evidence.evidence_id);
+    if (borrowed === undefined) throw new Error("Missing recorded Evidence");
+    expect(Object.isFrozen(borrowed)).toBe(true);
+    expect(Object.isFrozen(borrowed.normalized_result)).toBe(true);
+    expect(Reflect.set(borrowed, "operation", "forged")).toBe(false);
+    expect(ledger.forAnalysis(evidence.evidence_id)).toBe(borrowed);
+    expect(ledger.record(borrowed)).toEqual({ ok: true, value: "duplicate" });
+    const detached = ledger.get(evidence.evidence_id);
+    if (detached === undefined) throw new Error("Missing detached Evidence");
+    expect(Reflect.set(detached, "operation", "forged")).toBe(true);
+    expect(ledger.record(detached).ok).toBe(false);
+    expect(ledger.forAnalysis(evidence.evidence_id)).toBe(borrowed);
+    const snapshot = ledger.immutableBundle();
+    expect(snapshot).toEqual(ledger.export());
+    expect(snapshot.records[0]).toBe(borrowed);
+    expect(Object.isFrozen(snapshot.records)).toBe(true);
+    ledger.clear();
+    expect(ledger.forAnalysis(evidence.evidence_id)).toBeUndefined();
+    expect(ledger.immutableBundle().records).toEqual([]);
+    expect(snapshot.records).toEqual([evidence]);
   });
 });
 
@@ -129,7 +195,6 @@ describe("evidence ledger metadata imports", () => {
     });
     const created = ledger.recordUnknown(
       recordUnknownInputSchema.parse({
-        approved: true,
         question: "Which path is current?",
         severity: "high",
         domain: "fixture",
@@ -164,7 +229,13 @@ describe("evidence ledger metadata imports", () => {
         recordsAdded: 0,
         unknownsAdded: 0,
         changed: true,
-        metadataChanged: true,
+        replacements: [
+          {
+            kind: "metadata",
+            previous: mutation,
+            current: relocatedMutation,
+          },
+        ],
       },
     });
     expect(ledger.get(mutation.evidence_id)).toEqual(relocatedMutation);
@@ -174,7 +245,7 @@ describe("evidence ledger metadata imports", () => {
         recordsAdded: 0,
         unknownsAdded: 0,
         changed: false,
-        metadataChanged: false,
+        replacements: [],
       },
     });
   });
@@ -205,6 +276,32 @@ describe("evidence ledger metadata imports", () => {
 });
 
 describe("evidence bundle imports", () => {
+  it("classifies an authenticated Evidence record as the wrong import kind", () => {
+    const record = createEvidence(TARGET, PROVIDER, {
+      operation: "health",
+      parameters: {},
+      result: true,
+    });
+    const result = new EvidenceLedger().import(record);
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        _tag: "AnalysisInputError",
+        userMessage: expect.stringContaining(
+          `this JSON is one Evidence record (${record.evidence_id})`,
+        ),
+      },
+    });
+    if (result.ok) throw new Error("Expected a wrong-kind import failure");
+    expect(projectAnalysisError(result.error)).toMatchObject({
+      code: "invalid_request",
+      category: "invalid_input",
+      message: expect.stringContaining(
+        `this JSON is one Evidence record (${record.evidence_id})`,
+      ),
+    });
+  });
+
   it("rejects conflicting duplicate IDs without mutating the ledger", () => {
     const ledger = new EvidenceLedger();
     const first = createEvidence(TARGET, PROVIDER, {
@@ -241,7 +338,6 @@ describe("evidence bundle imports", () => {
       result: { action: "record" },
     });
     const unknown = recordUnknownInputSchema.parse({
-      approved: true,
       question: "What remains unresolved?",
       severity: "high",
       domain: "atomic-test",

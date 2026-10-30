@@ -1,7 +1,6 @@
 import { expect, it, onTestFinished } from "vitest";
 
 import { BinarySession } from "../../../src/application/binary/BinarySession.js";
-import { SessionProviderRouter } from "../../../src/application/binary/SessionProviderRouter.js";
 import { InvestigationRecords } from "../../../src/application/investigation/InvestigationRecords.js";
 import { createEvidence } from "../../../src/domain/evidence.js";
 import { recordUnknownInputSchema } from "../../../src/domain/residualUnknown.js";
@@ -9,13 +8,14 @@ import {
   createBinarySessionTargets,
   createCacheProvider,
   createTestBinarySession,
+  createTestProviderRouter,
 } from "../../fixtures/binarySession.js";
 
 const createSession = (
   records: InvestigationRecords = new InvestigationRecords(),
 ) => {
   const session = new BinarySession(
-    SessionProviderRouter.single(createCacheProvider([])),
+    createTestProviderRouter(createCacheProvider([])),
     records,
   );
   onTestFinished(async () => {
@@ -138,12 +138,20 @@ it("notifies an Unknown-only bundle change even when no new Evidence is added", 
   });
   expect(recipient.importEvidenceBundle(bundle)).toEqual({
     ok: true,
-    value: 0,
+    value: {
+      recordsAdded: 0,
+      unknownsAdded: 1,
+      totalRecords: bundle.records.length,
+    },
   });
   expect(revisions).toEqual([1]);
   expect(recipient.importEvidenceBundle(bundle)).toEqual({
     ok: true,
-    value: 0,
+    value: {
+      recordsAdded: 0,
+      unknownsAdded: 0,
+      totalRecords: bundle.records.length,
+    },
   });
   expect(revisions).toEqual([1]);
 });

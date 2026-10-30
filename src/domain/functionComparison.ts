@@ -1,5 +1,6 @@
 import { canonicalJson } from "./comparisonSemantics.js";
-import { parseFunctionEvidence } from "./functionDossierEvidence.js";
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
+import type { FunctionSnapshot } from "./functionDossierEvidence.js";
 import { functionMatch } from "./functionComparisonNormalization.js";
 import {
   functionComparisonResultSchema,
@@ -8,23 +9,16 @@ import {
 import { overallStatus, summarize } from "./functionComparisonResults.js";
 import { compareDimensions } from "./functionComparisonDimensions.js";
 
-export {
-  functionComparisonInputSchema,
-  functionComparisonResultSchema,
-} from "./functionComparisonSchemas.js";
-
-/** Compare two complete function Evidence records without fuzzy matching. */
+/** Compare two authenticated function snapshots without fuzzy matching. */
 export const compareFunctions = (
-  leftInput: unknown,
-  rightInput: unknown,
+  left: FunctionSnapshot,
+  right: FunctionSnapshot,
 ): FunctionComparisonResult => {
-  const left = parseFunctionEvidence(leftInput);
-  const right = parseFunctionEvidence(rightInput);
-  const links = [left.evidence[0].evidence_id, right.evidence[0].evidence_id];
+  const links = [left.evidence.evidence_id, right.evidence.evidence_id];
   const providersDiffer =
-    canonicalJson(left.provider, "Function comparison") !==
-    canonicalJson(right.provider, "Function comparison");
-  const dimensions = compareDimensions(left, right, links, providersDiffer);
+    canonicalJson(left.evidence.provider, "Function comparison") !==
+    canonicalJson(right.evidence.provider, "Function comparison");
+  const dimensions = compareDimensions(left, right, { links, providersDiffer });
   const match = functionMatch(left, right);
   const changes = dimensions.filter(({ status }) => status !== "unchanged");
   return functionComparisonResultSchema.parse({
@@ -45,6 +39,6 @@ export const compareFunctions = (
             ]
           : []),
       ]),
-    ].sort((a, b) => a.localeCompare(b)),
+    ].sort((a, b) => compareUnicodeCodePoints(a, b)),
   });
 };

@@ -1,56 +1,112 @@
 import { describe, expect, it } from "vitest";
 
 import { packageSetupSupport } from "../../../scripts/verify-package-discovery.mjs";
+import { parseLinuxDistribution } from "../../../src/application/LinuxHopper.js";
 
-describe("packaged setup support classification", () => {
-  it.each([
-    ["linux", true, true, true, true],
-    ["linux", true, false, true, false],
-    ["linux", false, true, false, false],
-    ["linux", false, false, false, false],
-    ["darwin", true, true, true, true],
-    ["darwin", true, false, true, false],
-    ["darwin", false, true, false, false],
-    ["darwin", false, false, false, false],
-    ["win32", true, true, true, false],
-    ["win32", true, false, true, false],
-    ["win32", false, true, false, false],
-    ["win32", false, false, false, false],
-  ] as const)(
-    "%s with node=%s and host=%s: agent setup=%s, Hopper setup=%s",
-    (platform, node, host, supportedSetupHost, hopperSetupSupported) => {
-      expect(
-        packageSetupSupport(
-          [
-            { name: "host", ok: host },
-            { name: "node", ok: node },
-          ],
-          platform,
-        ),
-      ).toEqual({ supportedSetupHost, hopperSetupSupported });
-    },
+const osRelease = (
+  fields: Record<string, string>,
+  architecture: NodeJS.Architecture = "x64",
+) =>
+  parseLinuxDistribution(
+    Object.entries(fields)
+      .map(([key, value]) => `${key}="${value}"`)
+      .join("\n"),
+    architecture,
   );
 
-  it.each([
-    { checks: undefined },
-    { checks: [] },
-    { checks: [{ name: "host", ok: true }] },
-  ])("requires an affirmative Node check: $checks", ({ checks }) => {
-    expect(packageSetupSupport(checks, "linux")).toEqual({
-      supportedSetupHost: false,
+/** A Debian-family host REA supports that the Hopper package never tests. */
+const KALI = osRelease({ ID: "kali", VERSION_ID: "2026.3", ID_LIKE: "debian" });
+const UBUNTU_24 = osRelease({ ID: "ubuntu", VERSION_ID: "24.04" });
+/** A tested distribution on an architecture the pinned Hopper packages lack. */
+const UBUNTU_24_ARM64 = osRelease(
+  { ID: "ubuntu", VERSION_ID: "24.04" },
+  "arm64",
+);
+
+const checks = ({ node = true, host = true } = {}) => [
+  { name: "node", ok: node },
+  { name: "host", ok: host },
+];
+
+describe("packaged setup support derivation", () => {
+  it("keeps an installer-untested REA-supported distribution out of the automated Hopper path", () => {
+    // The doctor host check passes on Kali, so reading installer applicability
+    // from it promised an automated install the packaged setup never offers,
+    // and Hopper readiness that setup never provides there.
+    expect(
+      packageSetupSupport(checks(), {
+        platform: "linux",
+        linuxDistribution: KALI,
+      }),
+    ).toEqual({
+      supportedSetupHost: true,
+      hopperReadinessRequired: false,
       hopperSetupSupported: false,
     });
   });
 
-  it("requires an affirmative host check only for Hopper setup", () => {
+  it("keeps an arm64 host off the x86_64-only automated Hopper path", () => {
+    // ubuntu-24.04-arm runs REA, but every pinned Linux Hopper package is
+    // x86_64, so packaged setup must not expect an automated install or
+    // Hopper readiness there.
     expect(
-      packageSetupSupport(
-        [
-          { name: "node", ok: true },
-          { name: "hopper", ok: true },
-        ],
-        "linux",
-      ),
-    ).toEqual({ supportedSetupHost: true, hopperSetupSupported: false });
+      packageSetupSupport(checks(), {
+        platform: "linux",
+        linuxDistribution: UBUNTU_24_ARM64,
+      }),
+    ).toEqual({
+      supportedSetupHost: true,
+      hopperReadinessRequired: false,
+      hopperSetupSupported: false,
+    });
+  });
+
+  it("follows the distribution's own applicability, not host readiness", () => {
+    expect(
+      packageSetupSupport(checks({ host: false }), {
+        platform: "linux",
+        linuxDistribution: UBUNTU_24,
+      }),
+    ).toEqual({
+      supportedSetupHost: true,
+      hopperReadinessRequired: false,
+      hopperSetupSupported: true,
+    });
+  });
+
+  it("keeps unreadable Linux applicability unknown", () => {
+    expect(
+      packageSetupSupport(checks(), { platform: "linux" }).hopperSetupSupported,
+    ).toBeUndefined();
+  });
+
+  it("uses the owner's macOS predicate and excludes Windows", () => {
+    expect(
+      packageSetupSupport(checks(), { platform: "darwin" })
+        .hopperSetupSupported,
+    ).toBe(true);
+    expect(
+      packageSetupSupport(checks({ host: false }), { platform: "darwin" })
+        .hopperSetupSupported,
+    ).toBe(false);
+    expect(
+      packageSetupSupport([], { platform: "darwin" }).hopperSetupSupported,
+    ).toBeUndefined();
+    expect(
+      packageSetupSupport(checks(), { platform: "win32" }).hopperSetupSupported,
+    ).toBe(false);
+  });
+
+  it("reports agent setup support from the node check alone", () => {
+    expect(
+      packageSetupSupport(checks({ node: false }), {
+        platform: "linux",
+        linuxDistribution: UBUNTU_24,
+      }),
+    ).toEqual({
+      supportedSetupHost: false,
+      hopperReadinessRequired: true,
+      hopperSetupSupported: true,
+    });
   });
 });

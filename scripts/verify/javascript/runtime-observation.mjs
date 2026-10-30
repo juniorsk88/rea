@@ -3,8 +3,8 @@
 import { readFile, realpath } from "node:fs/promises";
 import { parseArgs } from "node:util";
 
-import { analyzeJavaScriptApplication } from "../../../dist/application/javascript/JavaScriptApplicationService.js";
 import { reconcileJavaScriptRuntimeEvidence } from "../../../dist/application/javascript/JavaScriptRuntimeReconciliationService.js";
+import { analyzeJavaScriptApplicationWithOwnedScope } from "../../lib/javascript-application-analysis.mjs";
 import {
   completeVerifierRun,
   createVerifierRun,
@@ -36,22 +36,15 @@ const requestedLayers = [
   ...options.cache.map((path) => ({ role: "cache", path })),
   ...options.assets.map((path) => ({ role: "assets", path })),
 ];
-const canonicalLayers = await Promise.all(
-  requestedLayers.map(async (layer) => ({
-    ...layer,
-    path: await realpath(layer.path),
-  })),
-);
 const staticLayers = [];
-for (const layer of canonicalLayers) {
-  const analyzed = await analyzeJavaScriptApplication({
+for (const layer of requestedLayers) {
+  const analyzed = await analyzeJavaScriptApplicationWithOwnedScope({
     input_path: layer.path,
     format: "auto",
   });
-  if (!analyzed.ok) throw analyzed.error;
   staticLayers.push({
     role: layer.role,
-    analysis: analyzed.value,
+    analysis: analyzed,
     runtime_mappings: [],
   });
 }
