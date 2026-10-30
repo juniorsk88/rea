@@ -1,519 +1,529 @@
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { writeAmpRegistrationBackup } from "./cli/ampRegistrationBackup.js";
+import { registerToolFamilies } from "./contracts/toolFamilyIds.js";
+import { registerGpuCommands } from "./cli/gpuCommands.js";
+import { registerNativeFunctionMatchingCommands } from "./cli/nativeFunctionMatchingCommands.js";
+import { registerCaptureCommands } from "./cli/captureCommands.js";
+import { registerSignalCommands } from "./cli/signalCommands.js";
+import { registerWasmCommands } from "./cli/wasmCommands.js";
+import { registerApkSignatureCommands } from "./cli/apkSignatureCommands.js";
+import { snapshotEnvironment } from "./process/snapshotEnvironment.js";
+import { createDirectAnalysis } from "./composition/directAnalysis.js";
+import { registerEvmCommands } from "./cli/evmCommands.js";
+import { registerDesktopApplicationCommands } from "./cli/desktopApplicationCommands.js";
+import { registerGoCommands } from "./cli/goCommands.js";
+import { registerModelCommands } from "./cli/modelCommands.js";
+import { registerIl2cppCommands } from "./cli/il2cppCommands.js";
+import { registerRustCommands } from "./cli/rustCommands.js";
+import { registerPythonPycCommands } from "./cli/pythonPycCommands.js";
+import { registerErlangCommands } from "./cli/erlangCommands.js";
+import { registerSqliteCommands } from "./cli/sqliteCommands.js";
+import { registerAnalysisViewCommands } from "./cli/analysisViewCommands.js";
+import { registerBinaryDiagnosticsCommands } from "./cli/binaryDiagnosticsCommands.js";
+import { registerFridaCommands } from "./cli/fridaCommands.js";
+import type { FridaInstrumentationPort } from "./application/frida/FridaInstrumentationPort.js";
 import { Cli, z } from "incur";
-import { fileURLToPath } from "node:url";
-import { createInterface } from "node:readline/promises";
-
-import { runDoctor } from "./application/Doctor.js";
 import {
-  runDirectAnalysis,
-  runProviderAnalysis,
-  runSessionStatus,
-} from "./application/DirectAnalysis.js";
-import { runSetup, type SetupAction } from "./application/Setup.js";
-import { runUninstall } from "./application/Uninstall.js";
-import { runUpgrade, systemUpgradeHost } from "./application/Upgrade.js";
+  adaptCliOutputArgumentsForIncur,
+  normalizeCliArguments,
+  splitIncurBuiltinArguments,
+} from "./cliBuiltinArguments.js";
+import {
+  parseCliOutputArguments,
+  renderCliDocument,
+  renderCliOutputArgumentError,
+} from "./cliOutput.js";
+
+import { createLogger } from "./logger.js";
+import { parseLogLevel } from "./config/processStart.js";
 import { PRODUCT_IDENTITY } from "./identity.js";
-import { createLogger, parseLogLevel, type Logger } from "./logger.js";
-import { logCliCommand } from "./cliLogging.js";
-import { parseConfig } from "./config.js";
-import { importReferenceSource } from "./application/ReferenceSourceImport.js";
+import { currentClientRegistrationCommand } from "./application/ClientRegistrationIdentity.js";
+import { clientRegistrationCommandText } from "./cli/clientRegistrationCommandText.js";
+import { registerSetupCommands } from "./cli/setupCommands.js";
+import { registerCoreAnalysisCommands } from "./cli/coreAnalysisCommands.js";
+import { registerUtilityCommands } from "./cli/utilityCommands.js";
+import { registerArtifactCommands } from "./cli/artifactCommands.js";
+import { registerManagedCommands } from "./cli/managedCommands.js";
+import { registerFirmwareCommands } from "./cli/firmwareCommands.js";
+import { registerAndroidCommands } from "./cli/androidCommands.js";
+import { registerApktoolCommands } from "./cli/apktoolCommands.js";
+import { registerPcapCommands } from "./cli/pcapCommands.js";
+import { registerFlutterCommands } from "./cli/flutterCommands.js";
+import { registerJebCommands } from "./cli/jebCommands.js";
+import { registerAdbCommands } from "./cli/adbCommands.js";
 import { registerEvidenceCommands } from "./cliEvidenceCommands.js";
-import { registerProcessCommands } from "./cliProcessCommands.js";
-import { registerInvestigationCommands } from "./cliInvestigationCommands.js";
-import { projectAnalysisError } from "./domain/errors.js";
-import { projectReferenceSourceImportError } from "./application/ReferenceSourceImportTypes.js";
+import { registerEnvironmentCommands } from "./cli/environmentCommands.js";
+import { registerProcessCommands } from "./cli/processCommands.js";
+import { registerBrowserCommands } from "./cli/browserCommands.js";
+import { registerWebScriptCommands } from "./cli/webScriptCommands.js";
+import { registerWebModuleCommands } from "./cli/webModuleCommands.js";
+import { registerWebSourceLocationCommands } from "./cli/webSourceLocationCommands.js";
+import { registerWebRuntimeCommands } from "./cli/webRuntimeCommands.js";
+import { registerWebNetworkCaptureCommands } from "./cli/webNetworkCaptureCommands.js";
+import { registerJavaScriptRecoveryCommands } from "./cli/javascriptRecoveryCommands.js";
+import { registerAdvancedBrowserCommands } from "./cli/browserAdvancedCommands.js";
+import { registerBrowserScenarioCommands } from "./cliBrowserScenarioCommands.js";
+import { registerElectronCommands } from "./cli/electronCommands.js";
+import { registerJavaScriptRuntimeObservationCommands } from "./cli/javascriptRuntimeCommands.js";
+import { registerApplicationCommands } from "./cli/applicationCommands.js";
+import { presentOmittableDefaults } from "./cli/omittableDefaults.js";
+import type { CliInstance } from "./cli/types.js";
+import {
+  streamCliCommandResults,
+  type CliResultOutput,
+} from "./cli/cliResultOutput.js";
+import { registerReverseEngineeringCommands } from "./cli/reverseEngineeringCommands.js";
+import { registerCutterCommands } from "./cli/cutterCommands.js";
+import { excludeDeclaredSensitiveArguments } from "./cli/explicitSensitiveArguments.js";
+import { rejectSurplusCliArguments } from "./cli/strictPositionals.js";
+import { presentCliArgumentErrors } from "./cli/argumentErrors.js";
+import { completionHelpNote, createCliCompletions } from "./cli/completions.js";
+import {
+  closeCliGuidanceResources,
+  registerGuidanceCommands,
+} from "./cli/guidanceCommands.js";
+import { closeCliJavaScriptResources } from "./cli/javascriptApplicationAnalysis.js";
+import { registerGuidedWorkflowCommands } from "./cli/guidedWorkflowCommands.js";
+
+/** Close every process-owned resource used by CLI commands. */
+export const closeCliResources = async (): Promise<void> => {
+  const results = await Promise.allSettled([
+    closeCliJavaScriptResources(),
+    closeCliGuidanceResources(),
+  ]);
+  const failures = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1)
+    throw new AggregateError(failures, "CLI resource cleanup failed");
+};
 
 /**
  * Build the one-shot Incur CLI without starting Hopper at import time.
  * Analysis commands acquire and close their own sessions; bare `mcp` and
  * `--mcp` are intercepted by the executable dispatcher before this module loads.
  */
-export const createCli = (): ReturnType<typeof Cli.create> => {
+export const createCli = (
+  selectedEnvironment: Readonly<
+    Record<string, string | undefined>
+  > = process.env,
+  resultOutput?: CliResultOutput,
+  fridaInstrumentation?: FridaInstrumentationPort,
+): CliInstance => {
+  const environment = snapshotEnvironment(selectedEnvironment);
+  const analysis = createDirectAnalysis(environment);
+  // The executable reports an invalid level before every command except doctor.
+  // Doctor keeps going so its readiness report can name REA_LOG_LEVEL.
+  const level =
+    environment.REA_LOG_LEVEL === undefined
+      ? undefined
+      : parseLogLevel(environment.REA_LOG_LEVEL);
   const logger = createLogger(
     "cli",
-    process.env.REA_LOG_LEVEL === undefined
-      ? "silent"
-      : parseLogLevel(process.env.REA_LOG_LEVEL),
+    level?.ok === true ? level.value : "silent",
   );
-  const cli = Cli.create(PRODUCT_IDENTITY.cliBinary, {
-    version: process.env.REA_PACKAGE_VERSION ?? "0.0.0-development",
+  const timedCli = Cli.create(PRODUCT_IDENTITY.cliBinary, {
+    version: PRODUCT_IDENTITY.packageVersion,
     description: "Reverse engineer anything from your terminal or agent.",
+    globals: z.object({
+      timings: z
+        .boolean()
+        .default(false)
+        .describe("Write measured command timing to stderr."),
+    }),
     mcp: {
-      command: PRODUCT_IDENTITY.mcpCommand,
+      command: clientRegistrationCommandText(
+        currentClientRegistrationCommand({ environment }),
+      ),
       instructions:
         "Ask what software, artifact, protocol, or behavior the user wants to understand, then choose the available investigation capabilities that can produce evidence.",
     },
-    sync: {
-      cwd: fileURLToPath(new URL("..", import.meta.url)),
-      include: ["skills/*"],
-      suggestions: [
-        "understand how a software feature works",
-        "investigate an artifact or observed behavior",
-        "check my REA setup",
-      ],
+    sync: false,
+    update: {
+      // Incur's update:false only suppresses notices. Reject its explicit
+      // installer so ambiguous flags cannot bypass REA's verified workflow.
+      install: () => {
+        throw new Error(
+          "Use 'rea update' to update the identified installation. The '--update' alias accepts only global output flags.",
+        );
+      },
     },
   });
 
-  registerSetupCommands(cli, logger);
-  registerCoreCommands(cli, logger);
-  registerFunctionCommand(cli, logger);
-  registerSearchCommand(cli, logger);
-  registerXrefsCommand(cli, logger);
-  registerTraceCommand(cli, logger);
-  registerCapabilityCommands(cli, logger);
-  registerNativeCommands(cli, logger);
-  registerArtifactCommands(cli, logger);
-  registerInvestigationCommands(cli, logger);
-  registerEvidenceCommands(cli, logger);
-  registerReferenceSourceCommand(cli, logger);
-  registerProcessCommands(cli, logger);
-  return cli;
-};
+  timedCli.use(async (context, next) => {
+    if (!context.globals.timings) return next();
+    const started = performance.now();
+    try {
+      await next();
+    } finally {
+      // This interval covers CLI command dispatch, including result delivery.
+      // It is not a provider-only or analysis-only measurement.
+      process.stderr.write(
+        `${JSON.stringify({ rea_timings: { version: 1, command_ms: Math.round(performance.now() - started) } })}\n`,
+      );
+    }
+  });
+  // Command registrars do not inspect global options; preserve their existing
+  // type while Incur owns parsing and the middleware owns this added flag.
+  const cli = timedCli as unknown as CliInstance;
 
-const registerCoreCommands = (
-  cli: ReturnType<typeof Cli.create>,
-  logger: Logger,
-): void => {
-  const overviewOptions = z.object({
-    detail: z.enum(["concise", "detailed"]).default("concise"),
-    limit: z.number().int().min(1).max(50).default(10),
-    snapshot: z
-      .string()
-      .min(1)
-      .optional()
-      .describe("Load and update a local analysis snapshot"),
-  });
-  cli.command("analyze", {
-    description: "Get an overview of an app",
-    args: z.object({
-      path: z.string().describe("App, program, or Hopper database path"),
-    }),
-    options: overviewOptions,
-    run: ({ args, options }) =>
-      logCliCommand(logger, "analyze", () =>
-        runDirectAnalysis(
-          args.path,
-          "binary_overview",
-          { detail: options.detail, limit: options.limit },
-          { logger, snapshotPath: options.snapshot },
-        ),
+  registerSetupCommands(cli, logger, environment);
+  registerToolFamilies({
+    direct: () =>
+      registerCoreAnalysisCommands(
+        cli,
+        logger,
+        analysis.runDirectAnalysis,
+        environment,
       ),
+    // Enhanced workflows are MCP tools. Their CLI entry points live with core analysis.
+    enhanced: () => undefined,
+    native: () => {
+      registerReverseEngineeringCommands(cli, logger, environment);
+      registerCutterCommands(cli, logger, environment);
+      registerUtilityCommands(cli, logger, environment, analysis);
+      registerBinaryDiagnosticsCommands(cli, logger, environment);
+    },
+    artifact: () => {
+      registerWasmCommands(cli, logger, environment);
+      registerApkSignatureCommands(cli, logger, environment);
+      registerCaptureCommands(cli, logger, environment);
+      registerSignalCommands(cli, logger, environment);
+      registerEvmCommands(cli, logger, environment);
+      registerDesktopApplicationCommands(cli, logger);
+      registerGoCommands(cli, logger);
+      registerIl2cppCommands(cli, logger);
+      registerModelCommands(cli, logger);
+      registerGpuCommands(cli, logger);
+      registerRustCommands(cli, logger);
+      registerPythonPycCommands(cli, logger);
+      registerErlangCommands(cli, logger);
+      registerSqliteCommands(cli, logger, environment);
+      registerArtifactCommands(cli, logger, analysis.runProviderAnalysis);
+    },
+    managed: () =>
+      registerManagedCommands(cli, logger, analysis.runProviderAnalysis),
+    firmware: () => registerFirmwareCommands(cli, logger, environment),
+    android: () => registerAndroidCommands(cli, logger, environment),
+    pcap: () => registerPcapCommands(cli, logger, environment),
+    flutter: () => registerFlutterCommands(cli, logger),
+    frida: () => registerFridaCommands(cli, logger, fridaInstrumentation),
+    apktool: () => registerApktoolCommands(cli, logger, environment),
+    jeb: () => registerJebCommands(cli, logger, environment),
+    adb: () => registerAdbCommands(cli, logger, environment),
+    browser: () => {
+      registerBrowserCommands(cli, logger);
+      registerWebRuntimeCommands(cli, logger);
+      registerWebNetworkCaptureCommands(cli, logger, environment);
+      registerAdvancedBrowserCommands(cli, logger);
+      registerBrowserScenarioCommands(cli, logger, environment);
+    },
+    electron: () => registerElectronCommands(cli, logger, environment),
+    "javascript-runtime": () =>
+      registerJavaScriptRuntimeObservationCommands(cli, logger, environment),
+    application: () => {
+      registerGuidanceCommands(cli, logger);
+      registerGuidedWorkflowCommands(cli, logger);
+      registerAnalysisViewCommands(cli, logger);
+      registerEvidenceCommands(cli, logger);
+      registerEnvironmentCommands(cli, logger, environment);
+      registerProcessCommands(cli, logger, environment);
+      registerJavaScriptRecoveryCommands(cli, logger, environment);
+      registerWebScriptCommands(cli, logger);
+      registerWebModuleCommands(cli, logger, environment);
+      registerWebSourceLocationCommands(cli, logger, environment);
+      registerApplicationCommands(cli, logger);
+    },
+    session: () =>
+      registerNativeFunctionMatchingCommands(cli, logger, environment),
   });
-  cli.command("inspect", {
-    description: "Inspect an app overview with evidence",
-    args: z.object({
-      path: z.string().describe("App, program, or Hopper database path"),
-    }),
-    options: overviewOptions,
-    run: ({ args, options }) =>
-      logCliCommand(logger, "inspect", () =>
-        runDirectAnalysis(
-          args.path,
-          "binary_overview",
-          { detail: options.detail, limit: options.limit },
-          { logger, snapshotPath: options.snapshot },
-        ),
-      ),
-  });
-  cli.command("decompile", {
-    description: "Read one part of an app as code",
-    args: z.object({
-      path: z.string().describe("App or program path"),
-      address: z.string().describe("Procedure address"),
-    }),
-    options: z.object({ snapshot: z.string().min(1).optional() }),
-    run: ({ args, options }) =>
-      logCliCommand(logger, "decompile", () =>
-        runDirectAnalysis(
-          args.path,
-          "procedure_pseudo_code",
-          { procedure: args.address },
-          { logger, snapshotPath: options.snapshot },
-        ),
-      ),
-  });
-};
+  presentOmittableDefaults(cli);
+  if (resultOutput !== undefined) streamCliCommandResults(cli, resultOutput);
+  const serveStrict = rejectSurplusCliArguments(cli);
+  presentCliArgumentErrors(cli);
+  const serveDeclared = excludeDeclaredSensitiveArguments(cli);
+  const serve = cli.serve.bind(cli);
+  const complete = createCliCompletions(
+    cli as unknown as Parameters<typeof createCliCompletions>[0],
+    environment,
+  );
+  cli.serve = (arguments_ = process.argv.slice(2), options) => {
+    if (complete(arguments_, options ?? {})) return Promise.resolve();
+    const normalized = normalizeCliArguments(arguments_);
+    const { command, flags } = splitIncurBuiltinArguments(normalized);
+    const builtin = command[0] === PRODUCT_IDENTITY.cliBinary ? 1 : 0;
+    if (
+      command[builtin] === "mcp" &&
+      command[builtin + 1] === "add" &&
+      !flags.has("--help") &&
+      !flags.has("-h") &&
+      !flags.has("--llms") &&
+      !flags.has("--llms-full")
+    ) {
+      const write =
+        options?.stdout ?? ((text: string) => process.stdout.write(text));
+      if (flags.has("--version")) {
+        write(`${PRODUCT_IDENTITY.packageVersion}\n`);
+        return Promise.resolve();
+      }
+      if (flags.has("--schema")) {
+        const output = parseCliOutputArguments(normalized);
+        if (!output.validation.ok)
+          write(renderCliOutputArgumentError(output.validation));
+        else if (output.format === "csv" || output.format === "tsv")
+          write(
+            renderCliOutputArgumentError({
+              ok: false,
+              format: "json",
+              code: "UNSUPPORTED_OUTPUT_COMBINATION",
+              message:
+                "CSV/TSV output cannot represent the mcp add schema discovery error. Use a document format instead.",
+            }),
+          );
+        else
+          write(
+            renderCliDocument(
+              {
+                code: "SCHEMA_UNAVAILABLE",
+                message:
+                  "Schema discovery is not supported for mcp add. Use 'rea mcp add --help' for its options.",
+              },
+              output.format,
+              process.stdout.isTTY === true,
+            ),
+          );
+        (
+          options?.exit ??
+          ((code: number) => {
+            process.exitCode = code;
+          })
+        )(1);
+        return Promise.resolve();
+      }
+      // Incur's mcp add parser only understands spaced `--agent amp` forms; an
+      // equals form like `--agent=amp` is silently ignored, which would drop
+      // the requested agent and register against the default target. Normalize
+      // equals forms back to spaced forms before handing over to Incur.
+      const serveArguments = normalized.flatMap((token) => {
+        if (token.startsWith("--agent=") || token.startsWith("--command=")) {
+          const separator = token.indexOf("=");
+          const value = token.slice(separator + 1);
+          return value === "" ? [token] : [token.slice(0, separator), value];
+        }
+        return [token];
+      });
+      // Incur's Amp registration overwrites an existing rea entry (dropping its
+      // environment map) and reports success even when the settings file
+      // prevents a save. Guard that path: reject a settings file REA cannot
+      // update, back up the file, preserve the caller's environment, and verify
+      // the registration landed.
+      const ampRequested =
+        command.some(
+          (token, index) => token === "--agent" && command[index + 1] === "amp",
+        ) || command.includes("--agent=amp");
+      if (ampRequested) {
+        const settingsPath = join(homedir(), ".config", "amp", "settings.json");
+        let priorEnv: unknown;
+        let guardError: string | undefined;
+        let settingsText: string | undefined;
+        let parsedSettings: Record<string, unknown> | undefined;
+        try {
+          if (existsSync(settingsPath))
+            settingsText = readFileSync(settingsPath, "utf8");
+        } catch (cause) {
+          guardError = `Unable to read Amp settings.json: ${
+            cause instanceof Error ? cause.message : String(cause)
+          }`;
+        }
+        if (settingsText !== undefined) {
+          try {
+            const parsed: unknown = JSON.parse(settingsText);
+            if (
+              typeof parsed !== "object" ||
+              parsed === null ||
+              Array.isArray(parsed)
+            )
+              guardError = "Amp settings.json must contain a JSON object.";
+            else parsedSettings = parsed as Record<string, unknown>;
+          } catch (cause) {
+            guardError = `Amp settings.json is not valid JSON: ${
+              cause instanceof Error ? cause.message : String(cause)
+            }`;
+          }
+        }
+        if (parsedSettings !== undefined && settingsText !== undefined) {
+          const servers = parsedSettings["amp.mcpServers"];
+          if (
+            servers !== undefined &&
+            (typeof servers !== "object" ||
+              servers === null ||
+              Array.isArray(servers))
+          )
+            guardError =
+              "amp.mcpServers must be an object in Amp settings.json.";
+          else {
+            const entry =
+              typeof servers === "object" && servers !== null
+                ? (servers as Record<string, unknown>)["rea"]
+                : undefined;
+            if (typeof entry === "object" && entry !== null)
+              priorEnv = (entry as Record<string, unknown>)["env"];
+          }
+        }
+        const reportValidationError = (message: string): void => {
+          const output = parseCliOutputArguments(normalized);
+          if (!output.validation.ok)
+            write(renderCliOutputArgumentError(output.validation));
+          else
+            write(
+              renderCliDocument(
+                {
+                  code: "VALIDATION_ERROR",
+                  message,
+                  fieldErrors: [
+                    {
+                      code: "invalid_value",
+                      missing: false,
+                      path: "amp",
+                      message,
+                    },
+                  ],
+                },
+                output.format,
+                process.stdout.isTTY === true,
+              ),
+            );
+          (
+            options?.exit ??
+            ((code: number) => {
+              process.exitCode = code;
+            })
+          )(1);
+        };
+        if (guardError !== undefined) {
+          reportValidationError(`${guardError} Fix it before registering.`);
+          return Promise.resolve();
+        }
 
-const registerSetupCommands = (
-  cli: ReturnType<typeof Cli.create>,
-  logger: Logger,
-): void => {
-  cli.command("setup", {
-    description: "Install requirements and configure agents",
-    options: z.object({
-      yes: z
-        .boolean()
-        .default(false)
-        .describe("Approve user-owned setup actions without prompting"),
-      installHopper: z
-        .boolean()
-        .default(false)
-        .describe("Also approve Hopper installation with --yes"),
-    }),
-    alias: { yes: "y", installHopper: "install-hopper" },
-    run: ({ options, formatExplicit }) =>
-      logCliCommand(logger, "setup", () =>
-        runSetup(
-          {
-            approved: options.yes,
-            installHopper: options.installHopper,
-            structured: formatExplicit,
+        const runRegistration = (backupPath?: string): Promise<void> => {
+          const result = serveStrict(
+            serveArguments,
+            options ?? {},
+            (tokens, selected) =>
+              serveDeclared(tokens, selected, (declared, declaredOptions) =>
+                serve(
+                  adaptCliOutputArgumentsForIncur(declared),
+                  declaredOptions,
+                ),
+              ),
+          );
+          return result.then(() => {
+            let failure: string | undefined;
+            try {
+              if (!existsSync(settingsPath))
+                failure = "Amp settings.json was not created.";
+              else {
+                const text = readFileSync(settingsPath, "utf8");
+                const parsed = JSON.parse(text) as Record<string, unknown>;
+                const servers = parsed["amp.mcpServers"];
+                if (
+                  typeof servers !== "object" ||
+                  servers === null ||
+                  Array.isArray(servers) ||
+                  !("rea" in servers)
+                )
+                  failure =
+                    "Amp settings.json does not contain the rea registration after mcp add.";
+                else {
+                  const entry = (servers as Record<string, unknown>)["rea"];
+                  if (
+                    priorEnv !== undefined &&
+                    typeof entry === "object" &&
+                    entry !== null &&
+                    (entry as Record<string, unknown>)["env"] === undefined
+                  ) {
+                    (entry as Record<string, unknown>)["env"] = priorEnv;
+                    writeFileSync(
+                      settingsPath,
+                      `${JSON.stringify(parsed, null, 2)}\n`,
+                    );
+                  }
+                }
+              }
+            } catch (cause) {
+              failure = cause instanceof Error ? cause.message : String(cause);
+            }
+            if (failure !== undefined) {
+              const output = parseCliOutputArguments(normalized);
+              if (output.validation.ok)
+                write(
+                  renderCliDocument(
+                    {
+                      code: "VALIDATION_ERROR",
+                      message: failure,
+                      fieldErrors: [
+                        {
+                          code: "invalid_value",
+                          missing: false,
+                          path: "amp",
+                          message: failure,
+                        },
+                      ],
+                    },
+                    output.format,
+                    process.stdout.isTTY === true,
+                  ),
+                );
+              (
+                options?.exit ??
+                ((code: number) => {
+                  process.exitCode = code;
+                })
+              )(1);
+            } else if (backupPath !== undefined)
+              process.stderr.write(
+                `Amp MCP registration backup retained at ${backupPath}\n`,
+              );
+          });
+        };
+
+        if (settingsText === undefined) return runRegistration();
+        return writeAmpRegistrationBackup(settingsPath, settingsText).then(
+          (backup) => {
+            if (!backup.ok) {
+              const { kind, path, detail } = backup.error;
+              reportValidationError(
+                `Unable to create Amp settings backup (${kind}) at ${path}: ${detail}`,
+              );
+              return;
+            }
+            return runRegistration(backup.value);
           },
-          undefined,
-          options.yes || formatExplicit || process.stdin.isTTY !== true
-            ? undefined
-            : confirmSetup,
-        ),
+          (cause: unknown) => {
+            const detail =
+              cause instanceof Error ? cause.message : String(cause);
+            reportValidationError(
+              `Unable to create Amp settings backup: ${detail}`,
+            );
+          },
+        );
+      }
+    }
+    const result = serveStrict(normalized, options ?? {}, (tokens, selected) =>
+      serveDeclared(tokens, selected, (declared, declaredOptions) =>
+        serve(adaptCliOutputArgumentsForIncur(declared), declaredOptions),
       ),
-  });
-  cli.command("doctor", {
-    description: "Check whether REA is ready",
-    options: z.object({
-      target: z.string().optional().describe("Optional app path to check"),
-    }),
-    run: ({ options }) =>
-      logCliCommand(logger, "doctor", () => runDoctor(options.target)),
-  });
-  cli.command("uninstall", {
-    description: "Remove REA-owned agent configuration and skill files",
-    options: z.object({
-      purgeData: z
-        .boolean()
-        .default(false)
-        .describe("Also remove REA caches and state"),
-    }),
-    alias: { purgeData: "purge-data" },
-    run: ({ options }) =>
-      logCliCommand(logger, "uninstall", () => runUninstall(options.purgeData)),
-  });
-  cli.command("upgrade", {
-    description: "Upgrade a global npm installation to the latest REA release",
-    run: ({ formatExplicit }) =>
-      logCliCommand(logger, "upgrade", () =>
-        runUpgrade(
-          process.env.REA_PACKAGE_VERSION ?? "0.0.0-development",
-          systemUpgradeHost(),
-          formatExplicit ? "structured" : "human",
-        ),
-      ),
-  });
-};
-
-const confirmSetup = async (
-  actions: readonly SetupAction[],
-): Promise<boolean> => {
-  process.stdout.write("\nREA setup plan\n");
-  for (const action of actions)
-    process.stdout.write(
-      `  - ${action.detail}\n    ${action.target}${action.external ? " (external software)" : ""}\n`,
     );
-  const prompt = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-  try {
-    const answer = (await prompt.question("Continue? [Y/n] "))
-      .trim()
-      .toLowerCase();
-    return answer === "" || answer === "y" || answer === "yes";
-  } finally {
-    prompt.close();
-  }
-};
-
-const registerXrefsCommand = (
-  cli: ReturnType<typeof Cli.create>,
-  logger: Logger,
-): void => {
-  cli.command("xrefs", {
-    description: "List bounded references to an analyzed address",
-    args: z.object({
-      path: z.string().describe("App or program path"),
-      address: z.string().describe("Hexadecimal address"),
-    }),
-    options: z.object({ snapshot: z.string().min(1).optional() }),
-    run: ({ args, options }) =>
-      logCliCommand(logger, "xrefs", () =>
-        runDirectAnalysis(
-          args.path,
-          "xrefs",
-          { address: args.address },
-          { logger, snapshotPath: options.snapshot },
-        ),
-      ),
-  });
-};
-
-const registerTraceCommand = (
-  cli: ReturnType<typeof Cli.create>,
-  logger: Logger,
-): void => {
-  cli.command("trace", {
-    description: "Trace a bounded literal feature through analyzed references",
-    args: z.object({
-      path: z.string().describe("App or program path"),
-      query: z.string().min(1).describe("Literal feature query"),
-    }),
-    options: z.object({
-      caseSensitive: z.boolean().default(false),
-      limit: z.number().int().min(1).max(100).default(20),
-      maxOperations: z.number().int().min(1).max(100).default(20),
-      snapshot: z.string().min(1).optional(),
-    }),
-    alias: {
-      caseSensitive: "case-sensitive",
-      maxOperations: "max-operations",
-    },
-    run: ({ args, options }) =>
-      logCliCommand(logger, "trace", () =>
-        runDirectAnalysis(
-          args.path,
-          "trace_feature",
-          {
-            query: args.query,
-            case_sensitive: options.caseSensitive,
-            limit: options.limit,
-            max_operations: options.maxOperations,
-          },
-          { logger, snapshotPath: options.snapshot },
-        ),
-      ),
-  });
-};
-
-const registerCapabilityCommands = (
-  cli: ReturnType<typeof Cli.create>,
-  logger: Logger,
-): void => {
-  for (const command of ["capabilities", "providers"] as const) {
-    cli.command(command, {
-      description:
-        command === "capabilities"
-          ? "List provider capabilities and side effects"
-          : "List configured analysis providers",
-      run: () => logCliCommand(logger, command, () => runSessionStatus(logger)),
+    const note = completionHelpNote(normalized);
+    if (note === undefined) return result;
+    return result.then(() => {
+      const write =
+        options?.stdout ?? ((text: string) => process.stdout.write(text));
+      write(`\n${note}`);
     });
-  }
-};
-
-const registerFunctionCommand = (
-  cli: ReturnType<typeof Cli.create>,
-  logger: Logger,
-): void => {
-  cli.command("function", {
-    description: "Analyze one bounded function with evidence",
-    args: z.object({
-      path: z.string().describe("App or program path"),
-      address: z.string().describe("Procedure name or address"),
-    }),
-    options: z.object({
-      includeAssembly: z.boolean().default(false),
-      limit: z.number().int().min(1).max(500).default(100),
-      maxPseudocodeChars: z.number().int().min(1).max(100_000).default(20_000),
-      maxInstructions: z.number().int().min(1).max(5_000).default(500),
-      snapshot: z.string().min(1).optional(),
-    }),
-    alias: {
-      includeAssembly: "include-assembly",
-      maxPseudocodeChars: "max-pseudocode-chars",
-      maxInstructions: "max-instructions",
-    },
-    run: ({ args, options }) =>
-      logCliCommand(logger, "function", () =>
-        runDirectAnalysis(
-          args.path,
-          "analyze_function",
-          {
-            procedure: args.address,
-            include_assembly: options.includeAssembly,
-            limit: options.limit,
-            max_pseudocode_chars: options.maxPseudocodeChars,
-            max_instructions: options.maxInstructions,
-          },
-          { logger, snapshotPath: options.snapshot },
-        ),
-      ),
-  });
-};
-
-const registerSearchCommand = (
-  cli: ReturnType<typeof Cli.create>,
-  logger: Logger,
-): void => {
-  cli.command("search", {
-    description: "Search bounded analyzed strings or procedure names",
-    args: z.object({
-      path: z.string().describe("App or program path"),
-      pattern: z.string().min(1).describe("Literal text or regex pattern"),
-    }),
-    options: z.object({
-      kind: z.enum(["strings", "procedures"]).default("strings"),
-      mode: z.enum(["literal", "regex"]).default("literal"),
-      caseSensitive: z.boolean().default(false),
-      offset: z.number().int().min(0).default(0),
-      limit: z.number().int().min(1).max(100).default(100),
-      snapshot: z.string().min(1).optional(),
-    }),
-    alias: { caseSensitive: "case-sensitive" },
-    run: ({ args, options }) =>
-      logCliCommand(logger, "search", () =>
-        runDirectAnalysis(
-          args.path,
-          options.kind === "strings" ? "search_strings" : "search_procedures",
-          {
-            pattern: args.pattern,
-            mode: options.mode,
-            case_sensitive: options.caseSensitive,
-            offset: options.offset,
-            limit: options.limit,
-          },
-          { logger, snapshotPath: options.snapshot },
-        ),
-      ),
-  });
-};
-
-const registerReferenceSourceCommand = (
-  cli: ReturnType<typeof Cli.create>,
-  logger: Logger,
-): void => {
-  cli.command("import-reference-source", {
-    description: "Import a bounded source tree as historical reference only",
-    args: z.object({
-      root: z
-        .string()
-        .describe("Source root allowed by REA_REFERENCE_ROOTS_JSON"),
-    }),
-    run: ({ args }) =>
-      logCliCommand(logger, "import-reference-source", async () => {
-        const config = parseConfig(process.env);
-        if (!config.ok)
-          return {
-            error: "Import failed",
-            ...projectAnalysisError(config.error),
-          };
-        const imported = await importReferenceSource({
-          root: args.root,
-          caller: "rea-cli",
-          policy: config.value.referenceSourcePolicy,
-          importer: PRODUCT_IDENTITY.packageName,
-          importerVersion: null,
-        });
-        return imported.ok
-          ? imported.value
-          : {
-              error: "Import failed",
-              ...projectReferenceSourceImportError(imported.error),
-            };
-      }),
-  });
-};
-
-const registerArtifactCommands = (
-  cli: ReturnType<typeof Cli.create>,
-  logger: Logger,
-): void => {
-  cli.command("inventory-artifact", {
-    description: "Build a bounded deterministic artifact graph",
-    args: z.object({
-      path: z.string().describe("Application or package path"),
-    }),
-    options: z.object({
-      offset: z.number().int().min(0).default(0),
-      limit: z.number().int().min(1).max(500).default(100),
-    }),
-    run: ({ args, options }) =>
-      logCliCommand(logger, "inventory-artifact", () =>
-        runProviderAnalysis(
-          args.path,
-          "inventory_artifact",
-          {
-            node_offset: options.offset,
-            node_limit: options.limit,
-            occurrence_offset: options.offset,
-            occurrence_limit: options.limit,
-            edge_offset: options.offset,
-            edge_limit: options.limit,
-          },
-          logger,
-        ),
-      ),
-  });
-  cli.command("extract-artifact", {
-    description: "Extract explicitly selected artifact occurrences safely",
-    args: z.object({
-      path: z.string().describe("Application or package path"),
-      outputRoot: z.string().describe("Absent absolute output root"),
-      occurrenceIds: z
-        .array(z.string().regex(/^occ_[a-f0-9]{64}$/u))
-        .min(1)
-        .max(500),
-    }),
-    alias: { outputRoot: "output-root", occurrenceIds: "occurrence-ids" },
-    run: ({ args }) =>
-      logCliCommand(logger, "extract-artifact", () =>
-        runProviderAnalysis(
-          args.path,
-          "extract_artifact",
-          {
-            approved: true,
-            output_root: args.outputRoot,
-            occurrence_ids: args.occurrenceIds,
-          },
-          logger,
-        ),
-      ),
-  });
-};
-
-const registerNativeCommands = (
-  cli: ReturnType<typeof Cli.create>,
-  logger: Logger,
-): void => {
-  for (const [command, tool] of [
-    ["inspect-macho", "inspect_macho"],
-    ["inspect-signature", "inspect_signature"],
-    ["list-architectures", "list_architectures"],
-  ] as const) {
-    cli.command(command, {
-      description: `Run ${tool} without launching Hopper`,
-      args: z.object({ path: z.string().describe("Mach-O or app path") }),
-      run: ({ args }) =>
-        logCliCommand(logger, command, () =>
-          runProviderAnalysis(args.path, tool, {}, logger),
-        ),
-    });
-  }
-  cli.command("inspect-plist", {
-    description: "Parse app plist metadata without launching Hopper",
-    args: z.object({ path: z.string().describe("App or Mach-O path") }),
-    options: z.object({
-      relativePath: z.string().default("Contents/Info.plist"),
-    }),
-    alias: { relativePath: "relative-path" },
-    run: ({ args, options }) =>
-      logCliCommand(logger, "inspect-plist", () =>
-        runProviderAnalysis(
-          args.path,
-          "inspect_plist",
-          { relative_path: options.relativePath },
-          logger,
-        ),
-      ),
-  });
-  cli.command("demangle-swift", {
-    description: "Demangle a bounded Swift symbol batch without Hopper",
-    args: z.object({
-      path: z.string().describe("Artifact path used for evidence identity"),
-      symbols: z.array(z.string().min(1)).min(1).max(500),
-    }),
-    run: ({ args }) =>
-      logCliCommand(logger, "demangle-swift", () =>
-        runProviderAnalysis(
-          args.path,
-          "demangle_swift",
-          { symbols: args.symbols },
-          logger,
-        ),
-      ),
-  });
+  };
+  return cli;
 };

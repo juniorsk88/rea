@@ -1,93 +1,95 @@
-import type { McpServer } from "@modelcontextprotocol/server";
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 
-import type { BinarySessionPort } from "../application/BinarySession.js";
-import type { ToolContract } from "../contracts/toolContracts.js";
-import {
-  bundleComparisonInputSchema,
-  compareBundles,
-} from "../domain/bundleComparison.js";
+import type { BinarySessionPort } from "../application/binary/BinarySessionPort.js";
+import { readComparisonEvidenceBundles } from "../application/EvidenceBundleFiles.js";
+import { toolContract } from "../contracts/toolContracts.js";
+import { compareBundles } from "../domain/bundleComparison.js";
 import { createEvidence } from "../domain/evidence.js";
-import { EvidenceIntegrityError } from "../domain/errors.js";
-import { jsonValueSchema } from "../domain/jsonValue.js";
-import { err, ok } from "../domain/result.js";
-import { BUNDLE_COMPARISON_PROVIDER } from "./sessionToolPolicies.js";
-import { toCallToolResult } from "./toolResult.js";
-import { isSessionEvidence } from "./sessionEvidence.js";
+import { runDerivedOperation } from "./runDerivedOperation.js";
+import { recordEvidenceSources } from "../application/investigation/recordEvidenceSources.js";
+import { BUNDLE_COMPARISON_PROVIDER } from "../domain/investigationProviders.js";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
+import { withAdmittedAnalysis } from "./analysisAdmission.js";
+import { runAdmittedToolOperation } from "./admittedToolOperation.js";
+import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 
 /** Register canonical Evidence bundle comparison. */
 export const registerBundleComparisonTool = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   session: BinarySessionPort,
-  contract: ToolContract<"compare_bundles">,
+  contract: ReturnType<typeof toolContract<"compare_bundles">>,
+  resources: ArtifactResourceScope,
 ): void => {
+  const admission = withAdmittedAnalysis({ kind: "session", session });
   server.registerTool(
     contract.name,
     toolRegistrationOptions(contract),
-    (input) => {
-      const parsed = bundleComparisonInputSchema.parse(input);
-      const sourceIds = [
-        ...new Set([
-          ...parsed.left.records.map(({ evidence_id: id }) => id),
-          ...parsed.right.records.map(({ evidence_id: id }) => id),
-        ]),
-      ].sort();
-      if (
-        [...parsed.left.records, ...parsed.right.records].some(
-          (evidence) => !isSessionEvidence(session, evidence),
-        )
-      )
-        return toCallToolResult(
-          err(
-            new EvidenceIntegrityError(
-              "Bundle comparison input Evidence is not present in this session",
-            ),
-          ),
-          contract,
-        );
-      const ownedUnknownDigests = new Set(
-        session
-          .exportEvidenceBundle()
-          .unknowns.map(({ revision_digest: digest }) => digest),
-      );
-      if (
-        [...parsed.left.unknowns, ...parsed.right.unknowns].some(
-          ({ revision_digest: digest }) => !ownedUnknownDigests.has(digest),
-        )
-      )
-        return toCallToolResult(
-          err(
-            new EvidenceIntegrityError(
-              "Bundle comparison input unknown history is not present in this session",
-            ),
-          ),
-          contract,
-        );
-      const comparison = compareBundles(
-        parsed.left,
-        parsed.right,
-        parsed.record_pairs,
-        parsed.offset,
-        parsed.limit,
-      );
-      const evidence = createEvidence(undefined, BUNDLE_COMPARISON_PROVIDER, {
-        predicateType: "rea.bundle-comparison/v1",
-        operation: contract.name,
-        parameters: {
-          left_bundle_sha256: comparison.left_bundle_sha256,
-          right_bundle_sha256: comparison.right_bundle_sha256,
-          record_pairs: parsed.record_pairs,
-          offset: parsed.offset,
-          limit: parsed.limit,
+    async (input, context) =>
+      runAdmittedToolOperation(
+        server,
+        admission,
+        contract.name,
+        context.mcpReq.signal,
+        async () => {
+          const loaded = await readComparisonEvidenceBundles(
+            input.left_bundle_path,
+            input.right_bundle_path,
+            context.mcpReq.signal,
+            resources,
+            contract.name,
+          );
+          if (!loaded.ok)
+            return server.delivery.toCallToolResult(loaded, contract);
+          const { left, right } = loaded.value;
+          const computed = await runDerivedOperation(
+            context,
+            contract.name,
+            () => compareBundles(left, right, input.record_pairs),
+          );
+          if (!computed.ok)
+            return server.delivery.toCallToolResult(computed, contract);
+          const comparison = computed.value;
+          const sourceRecords = [
+            ...new Map(
+              [...left.records, ...right.records].map((record) => [
+                record.evidence_id,
+                record,
+              ]),
+            ).values(),
+          ];
+          const recordedSources = recordEvidenceSources(
+            (evidence) => session.recordEvidence(evidence),
+            sourceRecords,
+          );
+          if (!recordedSources.ok)
+            return server.delivery.toCallToolResult(recordedSources, contract);
+          const evidence = createEvidence(
+            undefined,
+            BUNDLE_COMPARISON_PROVIDER,
+            {
+              predicateType: "rea.bundle-comparison",
+              operation: contract.name,
+              parameters: {
+                left_bundle_sha256: comparison.left_bundle_sha256,
+                right_bundle_sha256: comparison.right_bundle_sha256,
+                record_pairs: input.record_pairs,
+              },
+              result: comparison,
+              confidence: "derived",
+              authority: "analyst-inference",
+              limitations: comparison.limitations,
+              evidenceLinks: sourceRecords.map(
+                ({ evidence_id }) => evidence_id,
+              ),
+            },
+          );
+          const recorded = session.recordEvidence(evidence);
+          return server.delivery.toEvidenceToolResult(
+            evidence,
+            contract,
+            recorded,
+          );
         },
-        result: jsonValueSchema.parse(comparison),
-        confidence: "derived",
-        authority: "analyst-inference",
-        limitations: comparison.limitations,
-        evidenceLinks: sourceIds,
-      });
-      const recorded = session.recordEvidence(evidence);
-      return toCallToolResult(recorded.ok ? ok(evidence) : recorded, contract);
-    },
+      ),
   );
 };

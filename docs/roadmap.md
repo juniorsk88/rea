@@ -1,16 +1,35 @@
-# Installation roadmap
+# REA roadmap
 
-REA setup currently configures the capabilities that exist today: its agent integrations, bundled skill, and optional Hopper provider.
+The [platform tracker](https://github.com/morluto/rea/issues/32),
+[process/Hopper tracker](https://github.com/morluto/rea/issues/48), and
+[browser tracker](https://github.com/morluto/rea/issues/39) track capability and
+verification work. Available tools and setup are documented in the
+[investigation guides](https://rea.tools/guides/),
+[installation guide](installation.md), and
+[generated catalog](mcp-contracts.md#generated-catalog).
 
-When REA has at least two real optional toolchains, setup can evolve into a capability-oriented wizard. It may ask whether the operator wants to investigate native binaries, websites, mobile applications, firmware, or runtime protocols, then propose only the tools needed for the selected work.
+## Priorities
 
-That future installer must preserve the current safety boundary:
+- Expand native architecture, type, and indirect-call verification.
+- Connect static findings and runtime observations across application layers.
+- Improve obfuscated managed-code comparisons and verified native links.
+- Extend process, protocol, filesystem, reconnect, and build-comparison coverage.
+- Evaluate additional providers and targets when an analyst workflow demonstrates
+  a capability gap.
 
-- detect and reuse existing tools;
-- disclose every source, destination, license, command, and system effect;
-- prefer user-local installation;
-- install only explicitly selected toolchains;
-- require tool-specific authorization for unattended system changes;
-- verify each installed tool before reporting readiness.
+## Admission criteria
 
-No placeholder tool choices or speculative installer registry are implemented until another supported toolchain makes the abstraction concrete.
+New capabilities must return useful evidence through shared CLI/MCP workflows,
+preserve observations and unknowns, and declare actual authority and lifecycle
+constraints. Agents compose experiments using ordinary commands, scripts, and
+fixture servers; custom orchestration needs a demonstrated requirement.
+
+Provider and platform claims require their corresponding
+[real verification lanes](testing.md#real-toolchain-verification-lanes).
+See [tool design](tool-design.md) for choosing a tool boundary and
+[Ghidra semantics](ghidra-provider.md) for the existing deep-provider contract.
+
+Setup remains additive, reuses existing tools, and requires approval for disclosed
+configuration and Hopper installation changes. Additional installer choices need
+an implemented toolchain and explicit scope; setup does not install or upgrade
+unrelated runtimes or dependencies.

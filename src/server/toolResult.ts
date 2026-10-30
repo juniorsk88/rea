@@ -1,73 +1,43 @@
-import type { CallToolResult } from "@modelcontextprotocol/server";
+import { isNativeObservationOperation } from "../domain/native/nativeObservation.js";
+import { isNativeInventoryOperation } from "../domain/native/nativeInventory.js";
+import { STDIO_DEFAULT_MAX_BUFFER_SIZE } from "@modelcontextprotocol/server";
+import { ToolResultDelivery } from "./ToolResultDelivery.js";
+import { INSPECT_ANALYSIS_VIEW_OPERATION } from "../domain/analysisView/analysisViewErrors.js";
+import { inspectAnalysisViewInputSchema } from "../domain/analysisView/analysisView.js";
+import type { Evidence } from "../domain/evidence.js";
+import { jsonValueSchema, type JsonValue } from "../domain/jsonValue.js";
 
-import {
-  AnalysisOutputError,
-  projectAnalysisError,
-  type AnalysisError,
-} from "../domain/errors.js";
-import type { Result } from "../domain/result.js";
-import type { JsonValue } from "../domain/jsonValue.js";
-import type { ToolContract } from "../contracts/toolContracts.js";
+/** Compose native Evidence continuation with the selected, parsed response budget. */
+export const createToolResultDelivery = (
+  maximumResponseBytes: number | undefined,
+): ToolResultDelivery =>
+  new ToolResultDelivery(
+    maximumResponseBytes ?? STDIO_DEFAULT_MAX_BUFFER_SIZE,
+    retainedEvidenceContinuation,
+  );
 
-/**
- * Translate an application result into MCP text content.
- * Error tags and safe messages remain visible while underlying causes, process
- * output, and other potentially sensitive details stay private.
- */
-export const toCallToolResult = (
-  result: Result<JsonValue, AnalysisError>,
-  contract: ToolContract,
-): CallToolResult =>
-  result.ok ? successResult(result.value, contract) : errorResult(result.error);
-
-const errorResult = (error: AnalysisError): CallToolResult => {
-  const projected = projectAnalysisError(error);
+/** Offer a named, schema-validated source page only for retained native analysis. */
+const retainedEvidenceContinuation = (
+  evidence: Evidence,
+): Readonly<Record<string, JsonValue>> => {
+  const view =
+    evidence.operation === "analyze_function"
+      ? { kind: "native", facet: "pseudocode", offset: 0 }
+      : isNativeInventoryOperation(evidence.operation)
+        ? { kind: "native-inventory", offset: 0, limit: 64 }
+        : isNativeObservationOperation(evidence.operation)
+          ? { kind: "native-observation", offset: 0, limit: 64 }
+          : undefined;
+  if (view === undefined) return {};
+  const input = inspectAnalysisViewInputSchema.safeParse({
+    source: { kind: "retained-evidence", evidence_id: evidence.evidence_id },
+    view,
+  });
+  if (!input.success) return {};
   return {
-    content: [
-      {
-        type: "text",
-        text: projected.message,
-      },
-    ],
-    structuredContent: { error: projected },
-    isError: true,
+    continuation: {
+      name: INSPECT_ANALYSIS_VIEW_OPERATION,
+      arguments: jsonValueSchema.parse(input.data),
+    },
   };
-};
-
-const successResult = (
-  value: JsonValue,
-  contract: ToolContract,
-): CallToolResult => {
-  const candidate = contract.kind === "session" ? { result: value } : value;
-  const parsed = contract.outputSchema.safeParse(candidate);
-  if (!parsed.success) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: "Analysis returned an unreadable result. Retry once; if it continues, run `rea doctor`.",
-        },
-      ],
-      structuredContent: {
-        error: projectAnalysisError(
-          new AnalysisOutputError(
-            contract.name,
-            "output does not match the tool contract",
-          ),
-        ),
-      },
-      isError: true,
-    };
-  }
-  return {
-    content: [{ type: "text", text: formatValue(value) }],
-    structuredContent: candidate,
-  };
-};
-
-const formatValue = (value: JsonValue): string => {
-  if (value === null) return "OK";
-  if (typeof value === "string") return value;
-  if (typeof value === "object") return JSON.stringify(value, null, 2);
-  return String(value);
 };

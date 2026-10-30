@@ -1,18 +1,22 @@
-import { createHash } from "node:crypto";
-
-import canonicalize from "canonicalize";
-import { z } from "zod";
-
-import { artifactComparisonResultSchema } from "./artifactComparison.js";
-import { artifactInventoryResultSchema } from "./artifactGraph.js";
-import { parseEvidence, type Evidence } from "./evidence.js";
-import { parseEvidenceBundle } from "./evidenceBundle.js";
-import { functionComparisonResultSchema } from "./functionComparison.js";
-import { functionDossierSchema } from "./hopperValues.js";
 import {
-  processCaptureComparisonSchema,
-  processCaptureSchema,
-} from "./processCapture.js";
+  ArtifactInventoryCarrierError,
+  parseArtifactInventoryEvidence,
+} from "./artifactInventoryEvidence.js";
+import { uniqueSorted } from "./canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
+import { comparisonSourceEvidenceSides } from "./comparisonSourceEvidence.js";
+import { readComparisonResult } from "./comparisonEvidenceResult.js";
+import type { Evidence } from "./evidence.js";
+import { hasComparisonEvidenceIdentity } from "./comparisonEvidenceIdentity.js";
+import { readEvidenceBundle } from "./evidenceBundle.js";
+import { AnalysisInputError } from "./analysisErrorCore.js";
+import { EvidenceIntegrityError } from "./evidenceErrors.js";
+import { analysisInputErrorFromIssues } from "./inputIssueProjection.js";
+import { readEvidencePayload } from "./evidenceValidation.js";
+import { functionDossierSchema } from "./native/functionDossier.js";
+import { assessFunctionCallCoverage } from "./functionCallCoverage.js";
+import { processCaptureSchema } from "./process/processCapture.js";
+import { digestCanonicalValue } from "./canonicalDigest.js";
 import {
   reconstructionClaimResultSchema,
   reconstructionSpecificationSchema,
@@ -29,78 +33,65 @@ import {
 } from "./reconstructionUnknowns.js";
 import type { ResidualUnknown } from "./residualUnknown.js";
 
-const evidenceIdSchema = z.string().regex(/^ev_[a-f0-9]{64}$/u);
-
-export {
-  reconstructionVerificationInputSchema,
-  reconstructionVerificationResultSchema,
-} from "./reconstructionVerificationSchemas.js";
-export type { ReconstructionVerificationResult } from "./reconstructionVerificationSchemas.js";
-
-const MAX_BUNDLE_RECORDS = 20_100;
-const MAX_UNKNOWN_REVISIONS = 10_000;
-const MAX_CANONICAL_BYTES = 32 * 1024 * 1024;
-
-const providers = {
-  behavioral: {
-    operation: "compare_process_captures",
-    predicate: "rea.process-comparison/v3",
-    id: "rea-process",
-    name: "REA deterministic process harness",
-  },
-  "structural-function": {
-    operation: "compare_functions",
-    predicate: "rea.function-comparison/v1",
-    id: "rea-function-comparison",
-    name: "REA function comparison",
-  },
-  "structural-artifact": {
-    operation: "compare_artifacts",
-    predicate: "rea.artifact-comparison/v1",
-    id: "rea-artifact-comparison",
-    name: "REA artifact comparison",
-  },
+const comparisonOperationsByClaimKind = {
+  behavioral: "compare_process_captures",
+  "structural-function": "compare_functions",
+  "structural-artifact": "compare_artifacts",
 } as const;
+
+interface FunctionSourceFacts {
+  readonly evidence_id: string;
+  readonly callCoverageBlockers: readonly string[];
+  readonly callCoverageDiagnostics: readonly string[];
+}
 
 /** Verify only explicitly declared claims; no global equivalence is inferred. */
 export const verifyReconstruction = (
   specificationInput: unknown,
   bundleInput: unknown,
-  offset: number,
-  limit: number,
 ): ReconstructionVerificationResult => {
-  const specification =
-    reconstructionSpecificationSchema.parse(specificationInput);
-  enforceInputSize(bundleInput);
-  const bundle = parseEvidenceBundle(bundleInput);
-  if (bundle.records.length > MAX_BUNDLE_RECORDS)
-    throw new TypeError("Reconstruction Evidence record limit exceeded");
-  if (bundle.unknowns.length > MAX_UNKNOWN_REVISIONS)
-    throw new TypeError("Reconstruction unknown revision limit exceeded");
+  const parsedSpecification =
+    reconstructionSpecificationSchema.safeParse(specificationInput);
+  if (!parsedSpecification.success)
+    throw analysisInputErrorFromIssues(
+      "verify_reconstruction",
+      parsedSpecification.error.issues,
+      specificationInput,
+      { cause: parsedSpecification.error },
+    );
+  const specification = parsedSpecification.data;
+  const bundleResult = readEvidenceBundle(bundleInput, {
+    operation: "verify_reconstruction",
+    path: ["evidence_bundle"],
+  });
+  if (!bundleResult.ok) throw bundleResult.error;
+  const bundle = bundleResult.value;
   const records = new Map(
     bundle.records.map((item) => [item.evidence_id, item]),
   );
   const heads = reconstructionUnknownHeads(bundle.unknowns);
   const results = specification.claims
-    .map((claim) => evaluateClaim(claim, records, heads))
-    .sort((left, right) => left.claim_id.localeCompare(right.claim_id, "en"));
-  const page = results.slice(offset, offset + limit);
+    .map((claim, index) => evaluateClaim(claim, index, records, heads))
+    .sort((left, right) =>
+      compareUnicodeCodePoints(left.claim_id, right.claim_id),
+    );
   const failed = count(results, "fail");
   const unresolved = count(results, "unknown");
   const probes = reconstructionProbes(results, heads);
   const evidenceLinks = uniqueSorted(
     results.flatMap(({ evidence_links: links }) => links),
   );
-  if (evidenceLinks.length > 20_100)
-    throw new TypeError("Reconstruction Evidence closure exceeds limit");
   const output = {
     status: failed > 0 ? "fail" : unresolved > 0 ? "unknown" : "pass",
-    specification_sha256: digest({
-      ...specification,
-      claims: [...specification.claims].sort((left, right) =>
-        left.claim_id.localeCompare(right.claim_id, "en"),
-      ),
-    }),
+    specification_sha256: digestCanonicalValue(
+      {
+        ...specification,
+        claims: [...specification.claims].sort((left, right) =>
+          compareUnicodeCodePoints(left.claim_id, right.claim_id),
+        ),
+      },
+      "Reconstruction specification",
+    ),
     summary: {
       total: results.length,
       passed: count(results, "pass"),
@@ -110,20 +101,12 @@ export const verifyReconstruction = (
       structural: results.filter(({ kind }) => kind !== "behavioral").length,
     },
     claims: {
-      items: page,
-      offset,
-      limit,
-      total: results.length,
-      next_offset:
-        offset + page.length < results.length ? offset + page.length : null,
+      items: results,
     },
-    recommended_probes: probes.items,
+    recommended_probes: probes,
     evidence_links: evidenceLinks,
     limitations: [
       "Pass means every declared claim passed; it does not establish global implementation equivalence.",
-      ...(probes.truncated
-        ? ["Recommended probes were truncated at the 2,000-item limit."]
-        : []),
     ],
   };
   return reconstructionVerificationResultSchema.parse(output);
@@ -131,42 +114,55 @@ export const verifyReconstruction = (
 
 const evaluateClaim = (
   claim: Claim,
+  claimIndex: number,
   records: ReadonlyMap<string, Evidence>,
   heads: ReadonlyMap<string, ResidualUnknown>,
 ): ClaimResult => {
   const comparison = records.get(claim.comparison_evidence_id);
   if (comparison === undefined)
-    throw new TypeError(
+    throw missingSourceInputError(
+      claimIndex,
       `Missing comparison Evidence ${claim.comparison_evidence_id}`,
     );
-  validateComparisonIdentity(claim, comparison);
-  const sides = sourceSides(claim, comparison);
-  const allSourceIds = [...sides.left, ...sides.right];
-  if (new Set(allSourceIds).size !== allSourceIds.length)
-    throw new TypeError(
-      "Comparison source Evidence must be unique and two-sided",
-    );
+  validateComparisonIdentity(claim, comparison, claimIndex);
+  const sides = comparisonSourceEvidenceSides(comparison);
+  const allSourceIds = uniqueSorted([...sides.left, ...sides.right]);
   if (!sameSet(comparison.evidence_links, allSourceIds))
-    throw new TypeError(
+    throw new EvidenceIntegrityError(
       "Comparison Evidence closure disagrees with its parameters",
+      {
+        userMessage:
+          "Comparison Evidence closure disagrees with its parameters",
+      },
     );
   const sources = allSourceIds.map((id) => {
     const source = records.get(id);
     if (source === undefined)
-      throw new TypeError(`Missing source Evidence ${id}`);
+      throw missingSourceInputError(
+        claimIndex,
+        `Missing source Evidence ${id}`,
+      );
     return source;
   });
-  validateSourceKinds(claim, sources);
-  const observed = observedStatus(claim, comparison);
-  const limitations = authorityLimitations(claim, sources, sides);
+  const functionSourceFacts = readValidatedSourceFacts(claim, sources);
+  const observation = comparisonObservation(claim, comparison);
+  const observed = observation.status;
+  const callCoverage = sourceCallCoverage(
+    claim,
+    functionSourceFacts,
+    observation.hasIndependentFunctionChange === true,
+  );
+  const blockers = [
+    ...authorityLimitations(claim, sources, sides),
+    ...callCoverage.blockers,
+  ];
   const relevantUnknowns = reconstructionClaimUnknowns(
     heads,
     comparison.evidence_id,
     allSourceIds,
+    observation.selectedDimensions ?? [claim.dimension],
   );
-  const status = classify(observed, limitations, relevantUnknowns);
-  const displayedUnknowns = relevantUnknowns.slice(0, 100);
-  const hiddenUnknownCount = relevantUnknowns.length - displayedUnknowns.length;
+  const status = classify(observed, blockers, relevantUnknowns);
   return reconstructionClaimResultSchema.parse({
     claim_id: claim.claim_id,
     kind: claim.kind,
@@ -177,167 +173,183 @@ const evaluateClaim = (
     left_evidence_ids: sides.left,
     right_evidence_ids: sides.right,
     evidence_links: uniqueSorted([comparison.evidence_id, ...allSourceIds]),
-    unknown_ids: displayedUnknowns.map(({ unknown_id: id }) => id),
+    unknown_ids: relevantUnknowns.map(({ unknown_id: id }) => id),
     limitations: uniqueSorted([
       ...comparison.limitations,
-      ...limitations,
-      ...displayedUnknowns.map(
+      ...observation.limitations,
+      ...blockers,
+      ...callCoverage.diagnostics,
+      ...relevantUnknowns.map(
         ({ question }) => `Residual unknown: ${question}`,
       ),
-      ...(hiddenUnknownCount > 0
-        ? [
-            `${hiddenUnknownCount} additional active residual unknowns affect this claim but are omitted by the 100-item display limit.`,
-          ]
-        : []),
     ]),
   });
 };
 
-const validateSourceKinds = (
+const readValidatedSourceFacts = (
   claim: Claim,
   sources: readonly Evidence[],
-): void => {
-  const expected =
-    claim.kind === "behavioral"
-      ? ["capture_process_scenario", "rea.process-capture/v4"]
-      : claim.kind === "structural-function"
-        ? ["analyze_function", "rea.analysis/v2"]
-        : ["inventory_artifact", "rea.analysis/v2"];
-  if (
-    sources.some(
-      (source) =>
-        source.operation !== expected[0] ||
-        source.predicate_type !== expected[1],
-    )
-  )
-    throw new TypeError(
-      "Comparison source Evidence has an unexpected observation type",
-    );
-  for (const source of sources) {
+): readonly FunctionSourceFacts[] => {
+  const isExpectedType = (source: Evidence): boolean => {
     if (claim.kind === "behavioral")
-      processCaptureSchema.parse(source.normalized_result);
-    else if (claim.kind === "structural-function")
-      functionDossierSchema.parse(source.normalized_result);
-    else artifactInventoryResultSchema.parse(source.normalized_result);
+      return (
+        source.operation === "capture_process_scenario" &&
+        source.predicate_type === "rea.process-capture"
+      );
+    if (claim.kind === "structural-function")
+      return (
+        source.operation === "analyze_function" &&
+        source.predicate_type === "rea.analysis"
+      );
+    return (
+      (source.operation === "inventory_artifact" ||
+        source.operation === "inspect_artifact") &&
+      source.predicate_type === "rea.analysis"
+    );
+  };
+  if (sources.some((source) => !isExpectedType(source)))
+    throw new EvidenceIntegrityError(
+      "Comparison source Evidence has an unexpected observation type",
+      {
+        userMessage:
+          "Comparison source Evidence has an unexpected observation type",
+      },
+    );
+  const functionSources: FunctionSourceFacts[] = [];
+  for (const source of sources) {
+    if (claim.kind === "behavioral") {
+      const capture = readEvidencePayload(
+        processCaptureSchema,
+        source.normalized_result,
+      );
+      if (!capture.ok) throw capture.error;
+    } else if (claim.kind === "structural-function") {
+      const parsedDossier = readEvidencePayload(
+        functionDossierSchema,
+        source.normalized_result,
+      );
+      if (!parsedDossier.ok) throw parsedDossier.error;
+      const dossier = parsedDossier.value;
+      const callCoverage = assessFunctionCallCoverage(
+        source.relationship_coverage,
+        dossier,
+      );
+      functionSources.push({
+        evidence_id: source.evidence_id,
+        callCoverageBlockers: callCoverage.blockers,
+        callCoverageDiagnostics: callCoverage.diagnostics,
+      });
+    } else {
+      try {
+        parseArtifactInventoryEvidence(source);
+      } catch (cause: unknown) {
+        if (cause instanceof EvidenceIntegrityError) throw cause;
+        if (cause instanceof ArtifactInventoryCarrierError)
+          throw new EvidenceIntegrityError(cause.message, {
+            cause,
+            userMessage: cause.message,
+          });
+        throw cause;
+      }
+    }
   }
+  return functionSources;
 };
 
-const validateComparisonIdentity = (claim: Claim, evidence: Evidence): void => {
-  parseEvidence(evidence);
-  const expected = providers[claim.kind];
-  if (
-    evidence.operation !== expected.operation ||
-    evidence.predicate_type !== expected.predicate ||
-    evidence.provider.id !== expected.id ||
-    evidence.provider.name !== expected.name ||
-    evidence.provider.version !== (claim.kind === "behavioral" ? "3" : "1") ||
-    evidence.confidence !== "derived" ||
-    evidence.authority !== "analyst-inference" ||
-    evidence.subject !== null
-  )
-    throw new TypeError("Comparison Evidence identity or authority disagrees");
-};
-
-const sourceSides = (
+const validateComparisonIdentity = (
   claim: Claim,
   evidence: Evidence,
-): { left: string[]; right: string[] } => {
-  const parameters = evidence.parameters;
-  if (claim.kind === "behavioral") {
-    const parsed = z
-      .object({
-        left_evidence_id: evidenceIdSchema,
-        right_evidence_id: evidenceIdSchema,
-      })
-      .passthrough()
-      .parse(parameters);
-    return {
-      left: [parsed.left_evidence_id],
-      right: [parsed.right_evidence_id],
-    };
+  claimIndex: number,
+): void => {
+  const expectedOperation = comparisonOperationsByClaimKind[claim.kind];
+  if (evidence.operation !== expectedOperation)
+    throw missingSourceInputError(
+      claimIndex,
+      `Claim ${claim.claim_id} requires ${expectedOperation} Evidence; selected ${evidence.operation}`,
+    );
+  if (!hasComparisonEvidenceIdentity(evidence)) {
+    const message = "Comparison Evidence identity or authority disagrees";
+    throw new EvidenceIntegrityError(message, { userMessage: message });
   }
-  const parsed = z
-    .object({
-      left_evidence_ids: z.array(evidenceIdSchema).min(1).max(100),
-      right_evidence_ids: z.array(evidenceIdSchema).min(1).max(100),
-    })
-    .passthrough()
-    .parse(parameters);
-  return { left: parsed.left_evidence_ids, right: parsed.right_evidence_ids };
 };
 
-const observedStatus = (claim: Claim, evidence: Evidence): ObservedStatus => {
+const comparisonObservation = (
+  claim: Claim,
+  evidence: Evidence,
+): {
+  readonly status: ObservedStatus;
+  readonly limitations: readonly string[];
+  readonly hasIndependentFunctionChange?: boolean;
+  readonly selectedDimensions?: readonly string[];
+} => {
   if (claim.kind === "behavioral") {
-    const result = processCaptureComparisonSchema.parse(
-      evidence.normalized_result,
-    );
-    validateProcessStatus(result);
-    return claim.dimension === "overall"
-      ? result.status
-      : result[claim.dimension];
+    const parsed = readComparisonResult(evidence, "compare_process_captures");
+    if (!parsed.ok) throw parsed.error;
+    const result = parsed.value.result;
+    if (claim.dimension !== "overall")
+      return { status: result[claim.dimension], limitations: [] };
+    if (
+      result.status === "unchanged" &&
+      result.first_divergence.status === "unknown"
+    )
+      return {
+        status: "unknown",
+        limitations: [result.first_divergence.reason],
+      };
+    return {
+      status: result.status,
+      limitations: [],
+    };
   }
   if (claim.kind === "structural-function") {
-    const result = functionComparisonResultSchema.parse(
-      evidence.normalized_result,
-    );
-    if (claim.dimension === "overall") return result.status;
+    const parsed = readComparisonResult(evidence, "compare_functions");
+    if (!parsed.ok) throw parsed.error;
+    const result = parsed.value.result;
+    if (claim.dimension === "overall")
+      return {
+        status: result.status,
+        selectedDimensions: [
+          "overall",
+          ...result.dimensions.map(({ dimension }) => dimension),
+        ],
+        limitations: result.dimensions.flatMap(
+          ({ limitations }) => limitations,
+        ),
+        // Historical overall changes can be caused only by incomplete call
+        // sets. Ignore that aggregate change when independently checking the
+        // source call-coverage limitations.
+        hasIndependentFunctionChange:
+          result.function_match.status === "mismatched" ||
+          (result.function_match.status === "matched" &&
+            result.dimensions.some(
+              (dimension) =>
+                dimension.dimension !== "calls" &&
+                dimension.status === "changed",
+            )),
+      };
     const dimension = result.dimensions.find(
       (item) => item.dimension === claim.dimension,
     );
-    if (dimension === undefined)
-      throw new TypeError("Function comparison dimension missing");
-    if (
-      dimension.evidence_links.some(
-        (id) => !evidence.evidence_links.includes(id),
-      )
-    )
-      throw new TypeError(
-        "Function dimension cites Evidence outside comparison closure",
-      );
-    return dimension.status;
+    if (dimension === undefined) {
+      const message = "Function comparison dimension missing";
+      throw new EvidenceIntegrityError(message, { userMessage: message });
+    }
+    return { status: dimension.status, limitations: dimension.limitations };
   }
-  const result = artifactComparisonResultSchema.parse(
-    evidence.normalized_result,
-  );
-  if (
-    result.changes.offset !== 0 ||
-    result.changes.next_offset !== null ||
-    result.changes.items.length !== result.changes.total
-  )
-    return "unknown";
-  if (
-    result.changes.items.some((item) =>
-      item.evidence_links.some((id) => !evidence.evidence_links.includes(id)),
-    )
-  )
-    throw new TypeError(
-      "Artifact change cites Evidence outside comparison closure",
-    );
-  return result.status;
+  const parsed = readComparisonResult(evidence, "compare_artifacts");
+  if (!parsed.ok) throw parsed.error;
+  const result = parsed.value.result;
+  return { status: result.status, limitations: [] };
 };
 
-const validateProcessStatus = (
-  result: z.infer<typeof processCaptureComparisonSchema>,
-): void => {
-  const dimensions = [
-    result.terminal,
-    result.exit,
-    result.filesystem,
-    result.protocol,
-    result.process,
-  ];
-  const expected = dimensions.includes("truncated")
-    ? "truncated"
-    : dimensions.some((status) =>
-          ["added", "removed", "changed"].includes(status),
-        )
-      ? "changed"
-      : dimensions.includes("unknown")
-        ? "unknown"
-        : "unchanged";
-  if (result.status !== expected)
-    throw new TypeError("Process comparison status contradicts its dimensions");
-};
+const missingSourceInputError = (claimIndex: number, message: string) =>
+  new AnalysisInputError("verify_reconstruction", { userMessage: message }, [
+    {
+      path: ["claims", claimIndex, "comparison_evidence_id"],
+      reason: "invalid_value",
+      message,
+    },
+  ]);
 
 const authorityLimitations = (
   claim: Claim,
@@ -350,6 +362,10 @@ const authorityLimitations = (
   const requiredAuthority =
     claim.kind === "behavioral" ? "controlled-replay" : "shipped-artifact";
   const limitations: string[] = [];
+  if (sides.left.some((id) => sides.right.includes(id)))
+    limitations.push(
+      "A source observation appears on both comparison sides; independent original and reconstruction observations are unavailable.",
+    );
   if (
     sources.some(
       (source) =>
@@ -368,13 +384,15 @@ const authorityLimitations = (
   )
     limitations.push("Structural source artifact identity is unavailable.");
   if (claim.kind === "behavioral") {
-    const byId = new Map(sources.map((source) => [source.evidence_id, source]));
-    const left = byId.get(sides.left[0] ?? "");
-    const right = byId.get(sides.right[0] ?? "");
+    const referenceEnvironment = sources[0]?.environment;
     if (
-      left?.environment === null ||
-      right?.environment === null ||
-      JSON.stringify(left?.environment) !== JSON.stringify(right?.environment)
+      referenceEnvironment === null ||
+      referenceEnvironment === undefined ||
+      sources.some(
+        ({ environment }) =>
+          environment === null ||
+          JSON.stringify(environment) !== JSON.stringify(referenceEnvironment),
+      )
     )
       limitations.push(
         "Controlled replay environments are unavailable or incompatible.",
@@ -383,32 +401,41 @@ const authorityLimitations = (
   return limitations;
 };
 
+const sourceCallCoverage = (
+  claim: Claim,
+  functionSources: readonly FunctionSourceFacts[],
+  hasIndependentFunctionChange: boolean,
+): { blockers: string[]; diagnostics: string[] } => {
+  if (
+    claim.kind !== "structural-function" ||
+    (claim.dimension !== "calls" &&
+      !(claim.dimension === "overall" && !hasIndependentFunctionChange))
+  )
+    return { blockers: [], diagnostics: [] };
+  return {
+    blockers: functionSources.flatMap(({ evidence_id, callCoverageBlockers }) =>
+      callCoverageBlockers.map((reason) => `Source ${evidence_id}: ${reason}`),
+    ),
+    diagnostics: functionSources.flatMap(
+      ({ evidence_id, callCoverageDiagnostics }) =>
+        callCoverageDiagnostics.map(
+          (reason) => `Source ${evidence_id}: ${reason}`,
+        ),
+    ),
+  };
+};
+
 const classify = (
   observed: ObservedStatus,
   limitations: readonly string[],
   unknowns: readonly ResidualUnknown[],
 ): ClaimResult["status"] => {
   if (limitations.length > 0) return "unknown";
-  if (["changed", "added", "removed"].includes(observed)) return "fail";
+  if (["changed", "added", "removed", "contradiction"].includes(observed))
+    return "fail";
   if (observed === "unknown" || observed === "truncated" || unknowns.length > 0)
     return "unknown";
   return "pass";
-};
-
-const digest = (value: unknown): string => {
-  const encoded = canonicalize(value);
-  if (encoded === undefined)
-    throw new TypeError("Specification canonicalization failed");
-  return createHash("sha256").update(encoded).digest("hex");
-};
-
-const enforceInputSize = (value: unknown): void => {
-  const encoded = canonicalize(value);
-  if (
-    encoded === undefined ||
-    Buffer.byteLength(encoded, "utf8") > MAX_CANONICAL_BYTES
-  )
-    throw new TypeError("Reconstruction Evidence bundle exceeds byte limit");
 };
 
 const count = (
@@ -416,7 +443,5 @@ const count = (
   status: ClaimResult["status"],
 ): number => items.filter((item) => item.status === status).length;
 const sameSet = (left: readonly string[], right: readonly string[]): boolean =>
-  left.length === right.length &&
+  uniqueSorted(left).length === uniqueSorted(right).length &&
   uniqueSorted(left).every((id, index) => id === uniqueSorted(right)[index]);
-const uniqueSorted = (values: readonly string[]): string[] =>
-  [...new Set(values)].sort((left, right) => left.localeCompare(right, "en"));
