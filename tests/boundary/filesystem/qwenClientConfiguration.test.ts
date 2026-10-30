@@ -1,3 +1,4 @@
+import { currentClientRegistrationCommand } from "../../../src/application/ClientRegistrationIdentity.js";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
@@ -7,16 +8,14 @@ import { parse as parseJsonc } from "jsonc-parser";
 import { readClientRegistrationStatuses } from "../../../src/application/ClientRegistrationStatus.js";
 import { configureClientConfiguration } from "../../../src/application/SetupClientConfiguration.js";
 import { systemSetupHost } from "../../../src/application/SetupHost.js";
+import { MANAGED_SKILL_FILES } from "../../../src/application/SetupSkill.js";
 import { supportedClients } from "../../../src/application/SupportedClients.js";
 import { systemUninstallHost } from "../../../src/application/Uninstall.js";
 import { PRODUCT_IDENTITY } from "../../../src/identity.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
-import {
-  clearClientLocationEnvironment,
-  NPX_REGISTRATION_COMMAND,
-} from "../../fixtures/clientEnvironment.js";
+import { clearClientLocationEnvironment } from "../../fixtures/clientEnvironment.js";
 
-const command = NPX_REGISTRATION_COMMAND;
+const command = currentClientRegistrationCommand();
 
 beforeEach(clearClientLocationEnvironment);
 afterEach(() => vi.unstubAllEnvs());
@@ -97,7 +96,7 @@ describe("Qwen Code client lifecycle", () => {
       model: { name: "qwen3-coder-plus" },
       mcpServers: {
         other: { command: "other-server" },
-        rea: { command: "npx", args: command.slice(1) },
+        rea: { command: command[0], args: command.slice(1) },
       },
     });
     expect(await configureClientConfiguration(client, {}, command)).toEqual({
@@ -115,12 +114,12 @@ describe("Qwen Code client lifecycle", () => {
     expect(removedText).toContain("// Keep this note.");
   });
 
-  it("reports a package-runner registration as aligned", async () => {
+  it("reports the selected installation as aligned", async () => {
     const { home, client } = await qwenClient();
     expect(
       (await configureClientConfiguration(client, {}, command)).status,
     ).toBe("configured");
-    const entry = resolve("scripts/rea.mjs");
+    const entry = command[1];
     const status = (
       await readClientRegistrationStatuses(home, entry, { environment: {} })
     ).find(({ client: name }) => name === "qwen_code");
@@ -149,21 +148,26 @@ describe("Qwen Code profile setup", () => {
       expect(await setup.configureClient(client, {}, command)).toEqual({
         status: "configured",
       });
-      expect(await setup.installSkill([client.name])).toBe("installed");
+      expect(await setup.installSkill([client.name])).toEqual({
+        ok: true,
+        value: "installed",
+      });
       const skill = join(home, ".agents", "skills", PRODUCT_IDENTITY.skillName);
+      await writeFile(join(skill, "user-notes.txt"), "user-authored");
       expect(await readFile(join(skill, "SKILL.md"), "utf8")).toContain(
         "reverse-engineer-anything",
       );
       expect(await setup.clientNeedsConfigure(client, {}, command)).toBe(false);
       expect(await setup.skillNeedsInstall([client.name])).toBe(false);
-      expect(await setup.installSkill([client.name])).toBe("unchanged");
+      expect(await setup.installSkill([client.name])).toEqual({
+        ok: true,
+        value: "unchanged",
+      });
       expect(
         (
-          await readClientRegistrationStatuses(
-            home,
-            resolve("scripts/rea.mjs"),
-            { environment },
-          )
+          await readClientRegistrationStatuses(home, command[1], {
+            environment,
+          })
         ).find(({ client: name }) => name === "qwen_code"),
       ).toMatchObject({ state: "aligned" });
       const uninstall = systemUninstallHost(home, undefined, environment);
@@ -173,7 +177,13 @@ describe("Qwen Code profile setup", () => {
       expect(registered).toEqual(client);
       expect((await uninstall.removeClient(client)).status).toBe("removed");
       expect((await uninstall.removeSkill()).status).toBe("removed");
-      await expect(access(skill)).rejects.toMatchObject({ code: "ENOENT" });
+      for (const relativePath of MANAGED_SKILL_FILES)
+        await expect(access(join(skill, relativePath))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      expect(await readFile(join(skill, "user-notes.txt"), "utf8")).toBe(
+        "user-authored",
+      );
       if (customHome)
         await expect(access(join(home, ".qwen"))).rejects.toMatchObject({
           code: "ENOENT",

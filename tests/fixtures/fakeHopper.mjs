@@ -1,10 +1,28 @@
 import { createServer } from "node:net";
 
-const [socketPath, token, runId, shutdownMode = "acknowledge"] =
-  process.argv.slice(2);
+const [
+  socketPath,
+  token,
+  runId,
+  shutdownMode = "acknowledge",
+  diagnosticMode = "quiet",
+  healthMode = "ready",
+  inventoryFailure = "none",
+  advertisedRequestBytes,
+] = process.argv.slice(2);
+const maxRequestBytes =
+  advertisedRequestBytes === undefined
+    ? 16 * 1024 * 1024
+    : Number(advertisedRequestBytes);
+let diagnosticOutputEmitted = false;
 const heldReplies = new Map();
+const sockets = new Set();
 if (process.send !== undefined)
   process.on("message", (message) => {
+    if (message?.disconnect === true) {
+      for (const socket of sockets) socket.destroy();
+      return;
+    }
     const reply = heldReplies.get(message?.release);
     if (reply === undefined) return;
     heldReplies.delete(message.release);
@@ -16,6 +34,18 @@ const shutdownResult = () => ({
   document_closed: shutdownMode !== "unconfirmed",
   ...(shutdownMode === "cleanup-required" ? { cleanup_required: true } : {}),
 });
+const emitDiagnosticOutput = () => {
+  if (diagnosticMode === "quiet" || diagnosticOutputEmitted) return;
+  diagnosticOutputEmitted = true;
+  const retainedTokenPrefixBytes = Math.floor(token.length / 2);
+  const preservedMarker = "source=/tmp/local-evidence.bin?cursor=keep&";
+  const fillLength = 8 * 1024 * 1024 - retainedTokenPrefixBytes;
+  const fill = "x".repeat(fillLength - Buffer.byteLength(preservedMarker));
+  process.stderr.write(`${fill}${preservedMarker}`);
+  setImmediate(() => {
+    process.stderr.write(token);
+  });
+};
 const capabilityUnavailableResult = (id) => ({
   id,
   error: {
@@ -82,6 +112,46 @@ const enhancedFixtureResult = (method) => {
       return [{ address: "0x1000", value: "fixture" }];
     case "procedure_pseudo_code":
       return "return 0;";
+    case "rea_caller_scan_target":
+      return {
+        target: {
+          address: "0x1000",
+          name: "fixture",
+          symbol: null,
+          classification: null,
+          body: {
+            available: false,
+            reason: "The fixture has no function body-extent observation.",
+          },
+        },
+        instructions: ["0x1000"],
+        instructions_complete: true,
+      };
+    case "rea_caller_base":
+      return {
+        target: {
+          address: "0x1000",
+          name: "fixture",
+          symbol: null,
+          classification: null,
+          body: {
+            available: false,
+            reason: "The fixture has no function body-extent observation.",
+          },
+        },
+        instructions: ["0x1000"],
+        instructions_complete: true,
+        callers: [],
+        callers_complete: true,
+      };
+    case "rea_caller_scan_page":
+      return {
+        start: 0,
+        next: 0,
+        total: 0,
+        oversized: false,
+        items: [],
+      };
     case "analyze_function": {
       return {
         procedure: {
@@ -154,6 +224,8 @@ const sendEchoWithProgress = (send, request) => {
 };
 
 const server = createServer((socket) => {
+  sockets.add(socket);
+  socket.once("close", () => sockets.delete(socket));
   socket.on("error", () => undefined);
   socket.setEncoding("utf8");
   let buffer = "";
@@ -182,21 +254,29 @@ const server = createServer((socket) => {
       if (request.token !== token) {
         send({ id: request.id, error: { code: -32001, message: "bad token" } });
       } else if (request.method === "health") {
-        send(
-          {
-            id: request.id,
-            result: {
-              name: "REA Hopper bridge",
-              version: "1.0.0",
-              run_id: runId,
+        emitDiagnosticOutput();
+        const reply = () =>
+          send(
+            {
+              id: request.id,
+              result: {
+                name: "REA Hopper bridge",
+                version: "1.0.0",
+                run_id: runId,
+                process_id: process.pid,
+                max_request_bytes: maxRequestBytes,
+              },
             },
-          },
-          true,
-        );
+            true,
+          );
+        if (healthMode === "gated") heldReplies.set(request.id, reply);
+        else if (healthMode === "ready") reply();
+        else throw new Error(`Unknown health fixture mode: ${healthMode}`);
       } else if (
         request.method === "shutdown" ||
         request.method === "shutdown_document"
       ) {
+        if (shutdownMode === "exit-without-ack") process.exit(0);
         send({ id: request.id, result: shutdownResult() });
         if (shutdownMode !== "cleanup-required") setTimeout(closeServer, 2);
       } else if (request.method === "hang") {
@@ -214,6 +294,19 @@ const server = createServer((socket) => {
         for (const message of bridgeEventMessages) send(message);
       } else if (request.method === "capability_unavailable") {
         send(capabilityUnavailableResult(request.id));
+      } else if (
+        inventoryFailure !== "none" &&
+        (request.method === "list_strings" ||
+          request.method === "list_procedures")
+      ) {
+        send({
+          id: request.id,
+          error: {
+            code: -32000,
+            type: inventoryFailure,
+            message: "fixture inventory unavailable",
+          },
+        });
       } else if (request.method === "current_document") {
         send({ id: request.id, result: "fixture" });
       } else if (enhancedFixtureResult(request.method) !== undefined) {
@@ -249,5 +342,6 @@ const closeServer = () =>
     if (process.connected) process.disconnect();
   });
 
-server.listen(socketPath);
+if (diagnosticMode === "noisy_no_socket") emitDiagnosticOutput();
+else server.listen(socketPath);
 process.on("SIGTERM", closeServer);
